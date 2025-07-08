@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15
+    container_name: chatbot-postgres
+    environment:
+      POSTGRES_DB: resturent
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - chatbot-network
+
+  # MongoDB for business configurations and schemas
+  mongodb:
+    image: mongo:7
+    container_name: chatbot-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password
+      MONGO_INITDB_DATABASE: chatbot_config
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - chatbot-network
+
+  # Redis for caching
+  redis:
+    image: redis:7-alpine
+    container_name: chatbot-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - chatbot-network
+
+  # FastAPI Application
+  app:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: chatbot-app
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=resturent
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_PORT=5432
+      - MONGODB_URI=mongodb://admin:password@mongodb:27017
+      - MONGODB_DB=chatbot_config
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - JWT_SECRET_KEY=your-super-secret-jwt-key-change-this-in-production
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DEBUG=True
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - mongodb
+      - redis
+    volumes:
+      - ./backend:/app
+    networks:
+      - chatbot-network
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  postgres_data:
+  mongodb_data:
+  redis_data:
+
+networks:
+  chatbot-network:
+    driver: bridge 
