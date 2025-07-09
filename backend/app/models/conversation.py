@@ -7,7 +7,6 @@ from typing import Dict, List, Optional, Any
 from pydantic import BaseModel, Field
 from bson import ObjectId
 from backend.app.models.business import PyObjectId
-from backend.app.services.vector_search import FaissVectorSearchService
 
 class Message(BaseModel):
     """Individual message in a conversation"""
@@ -113,5 +112,5 @@ class ConversationResponse(BaseModel):
     context: ConversationContext
     analytics: Optional[Dict[str, Any]] = None
 
-async def index_business_schemas(business_id: str):
-    await FaissVectorSearchService().index_business_schemas(business_id) 
+# This function was removed to avoid circular imports
+# Use the service directly where needed 

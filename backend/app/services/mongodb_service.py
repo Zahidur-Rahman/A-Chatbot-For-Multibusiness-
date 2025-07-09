@@ -22,7 +22,6 @@ class MongoDBService:
     """MongoDB service for multi-business chatbot"""
     
     def __init__(self):
-        from backend.app.config import get_settings
         self.settings = get_settings()
         self.client: Optional[AsyncIOMotorClient] = None
         self.db: Optional[AsyncIOMotorDatabase] = None

@@ -13,6 +13,8 @@ import re
 import os
 import json
 from datetime import datetime
+from pydantic import BaseModel
+from bson import ObjectId
 
 from backend.app.config import get_settings, Settings
 from backend.app.auth.routes import router as auth_router
@@ -25,7 +27,7 @@ from backend.app.mcp.mcp_client import MCPClient
 from backend.app.auth.jwt_handler import get_current_user, require_business_access, require_admin
 from fastapi_limiter import FastAPILimiter
 from fastapi_limiter.depends import RateLimiter
-import aioredis
+import redis.asyncio as aioredis
 from backend.app.models.business import BusinessConfig, BusinessConfigCreate, BusinessConfigUpdate
 from backend.app.models.user import User, UserCreate, UserUpdate
 from backend.app.services.mongodb_service import mongodb_service

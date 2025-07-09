@@ -12,7 +12,7 @@ import time
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv # Import find_dotenv for robust path finding
 import traceback
 
 # MCP imports
@@ -28,18 +28,31 @@ from mcp.types import (
     Tool,
 )
 
-# Load environment variables
-load_dotenv()
-
 # Configure logging
+# Set level to DEBUG temporarily to see all verbose logs
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Set to INFO to reduce log spam
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stderr)
     ]
 )
 logger = logging.getLogger("multi-business-mcp-server")
+
+# --- DOTENV LOADING ---
+# Try to find the .env file explicitly. This is more robust.
+# It searches the current directory and its parents.
+dotenv_path = find_dotenv()
+if dotenv_path:
+    logger.info(f"Found .env file at: {dotenv_path}")
+    load_dotenv(dotenv_path)
+    logger.info("Loaded .env file successfully.")
+else:
+    logger.warning("No .env file found by find_dotenv(). Ensure it's in the root or a parent directory.")
+    # Fallback to default load_dotenv() behavior if find_dotenv fails, though less reliable
+    load_dotenv()
+# --- END DOTENV LOADING ---
+
 
 class DummyNotificationOptions:
     tools_changed = None
@@ -51,33 +64,70 @@ class ConnectionPoolManager:
         self.pools = {}
         self.business_configs = {}
         self.lock = threading.Lock()
-        self.health_check_interval = 300  # 5 minutes
+        self.health_check_interval = int(os.getenv("HEALTH_CHECK_INTERVAL_SECONDS", "300")) # 5 minutes
         self.last_health_check = defaultdict(int)
+        self.last_health_status = defaultdict(lambda: None)  # Track last health status
         self._load_business_configs()
     
     def _load_business_configs(self):
         """Load business configurations from environment variables"""
         # Load business IDs from environment
-        business_ids = os.getenv("BUSINESS_IDS", "").split(",")
+        business_ids_raw = os.getenv("BUSINESS_IDS")
+        logger.debug(f"DEBUG: BUSINESS_IDS raw from os.getenv: '{business_ids_raw}'")
+
+        if not business_ids_raw:
+            logger.warning("BUSINESS_IDS environment variable is not set or empty.")
+            return
+
+        # Attempt to clean BUSINESS_IDS string to remove common misconfigurations (quotes, brackets)
+        cleaned_business_ids_str = business_ids_raw.strip()
+        if cleaned_business_ids_str.startswith('[') and cleaned_business_ids_str.endswith(']'):
+            cleaned_business_ids_str = cleaned_business_ids_str[1:-1] # Remove outer brackets
+
+        # Remove any single or double quotes that might wrap individual business IDs
+        cleaned_business_ids_str = cleaned_business_ids_str.replace("'", "").replace('"', '')
+
+        # Split and strip each ID
+        business_ids = [bid.strip() for bid in cleaned_business_ids_str.split(",") if bid.strip()]
+
+        logger.info(f"DEBUG: Parsed business_ids after cleaning: {business_ids}")
         
+        if not business_ids:
+            logger.warning("No valid business IDs found after parsing BUSINESS_IDS.")
+            return
+
         for business_id in business_ids:
-            business_id = business_id.strip()
-            if not business_id:
+            # Ensure business_id is clean for uppercase conversion
+            business_id = business_id.strip() 
+            if not business_id: # Skip if it resulted in an empty string
                 continue
                 
-            # Load business-specific config from environment
-            prefix = f"BUSINESS_{business_id.upper()}_"
+            # Construct prefix for environment variables (e.g., BUSINESS_RESTURENT_POSTGRES_)
+            prefix_upper = f"BUSINESS_{business_id.upper()}_POSTGRES_"
+            
+            # Retrieve individual configuration values
+            host = os.getenv(f"{prefix_upper}HOST")
+            database = os.getenv(f"{prefix_upper}DB")
+            user = os.getenv(f"{prefix_upper}USER")
+            password = os.getenv(f"{prefix_upper}PASSWORD")
+            port_str = os.getenv(f"{prefix_upper}PORT", "5432") # Get as string first
+
+            # Debugging for each specific config variable
+            logger.debug(f"DEBUG: {business_id}: Attempting to fetch {prefix_upper}HOST. Result: '{host}'")
+            logger.debug(f"DEBUG: {business_id}: Attempting to fetch {prefix_upper}DB. Result: '{database}'")
+            logger.debug(f"DEBUG: {business_id}: Attempting to fetch {prefix_upper}USER. Result: '{user}'")
+            logger.debug(f"DEBUG: {business_id}: Attempting to fetch {prefix_upper}PASSWORD. Result: '{password}'")
+            logger.debug(f"DEBUG: {business_id}: Attempting to fetch {prefix_upper}PORT. Result: '{port_str}'")
+
             config = {
-                "host": os.getenv(f"{prefix}POSTGRES_HOST"),
-                "database": os.getenv(f"{prefix}POSTGRES_DB"),
-                "user": os.getenv(f"{prefix}POSTGRES_USER"),
-                "password": os.getenv(f"{prefix}POSTGRES_PASSWORD"),
-                "port": int(os.getenv(f"{prefix}POSTGRES_PORT", "5432")),
-                # Add connection pool settings
-                "minconn": int(os.getenv(f"{prefix}MIN_CONNECTIONS", "2")),
-                "maxconn": int(os.getenv(f"{prefix}MAX_CONNECTIONS", "10")),
-                # Add connection timeout settings
-                "connect_timeout": int(os.getenv(f"{prefix}CONNECT_TIMEOUT", "30")),
+                "host": host,
+                "database": database,
+                "user": user,
+                "password": password,
+                "port": int(port_str),
+                "minconn": int(os.getenv(f"BUSINESS_{business_id.upper()}_MIN_CONNECTIONS", "2")),
+                "maxconn": int(os.getenv(f"BUSINESS_{business_id.upper()}_MAX_CONNECTIONS", "10")),
+                "connect_timeout": int(os.getenv(f"BUSINESS_{business_id.upper()}_CONNECT_TIMEOUT", "30")),
                 "keepalives": 1,
                 "keepalives_idle": 30,
                 "keepalives_interval": 10,
@@ -86,17 +136,18 @@ class ConnectionPoolManager:
             
             # Validate that all required config is present
             required_fields = ["host", "database", "user", "password"]
-            if all(config.get(field) for field in required_fields):
+            missing_fields = [field for field in required_fields if not config.get(field)]
+
+            if not missing_fields:
                 self.business_configs[business_id] = config
                 logger.info(f"Loaded configuration for business: {business_id}")
             else:
-                missing_fields = [field for field in required_fields if not config.get(field)]
-                logger.warning(f"Incomplete configuration for business: {business_id}, missing: {missing_fields}")
+                logger.warning(f"Incomplete configuration for business: '{business_id}', missing: {missing_fields}")
     
     def _create_connection_pool(self, business_id: str) -> SimpleConnectionPool:
         """Create a new connection pool for a business"""
-        config = self.business_configs[business_id]
-        
+        config = self.business_configs[business_id].copy() # Use a copy to pop values
+
         # Extract pool-specific settings
         minconn = config.pop("minconn", 2)
         maxconn = config.pop("maxconn", 10)
@@ -105,12 +156,12 @@ class ConnectionPoolManager:
             pool = SimpleConnectionPool(
                 minconn=minconn,
                 maxconn=maxconn,
-                **config
+                **config # Pass remaining config directly to psycopg2
             )
             logger.info(f"Created connection pool for business: {business_id} (min={minconn}, max={maxconn})")
             return pool
         except Exception as e:
-            logger.error(f"Failed to create pool for business {business_id}: {e}")
+            logger.error(f"Failed to create pool for business {business_id}: {e}", exc_info=True)
             raise
     
     def get_pool(self, business_id: str) -> SimpleConnectionPool:
@@ -128,70 +179,94 @@ class ConnectionPoolManager:
         """Get a connection from the pool with health check"""
         current_time = time.time()
         
-        # Perform health check if needed
+        # Only perform health check if not already failing
         if current_time - self.last_health_check[business_id] > self.health_check_interval:
-            self._health_check(business_id)
+            try:
+                self._health_check(business_id)
+            except Exception as e:
+                logger.error(f"Health check failed for business {business_id}: {e}")
             self.last_health_check[business_id] = current_time
         
         pool = self.get_pool(business_id)
         try:
             connection = pool.getconn()
-            if connection.closed:
-                logger.warning(f"Got closed connection for business {business_id}, attempting to recreate")
-                self._recreate_pool(business_id)
-                connection = pool.getconn()
+            # Basic check if the connection is usable
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
             return connection
         except Exception as e:
-            logger.error(f"Failed to get connection for business {business_id}: {e}")
-            raise
+            logger.warning(f"Failed to get usable connection for business {business_id}: {e}. Attempting to recreate pool.", exc_info=True)
+            self._recreate_pool(business_id)
+            # After recreation, try getting a connection one more time
+            try:
+                connection = pool.getconn()
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT 1")
+                return connection
+            except Exception as e_retry:
+                logger.error(f"Failed to get connection even after pool recreation for business {business_id}: {e_retry}", exc_info=True)
+                raise
     
     def return_connection(self, business_id: str, connection, error=False):
         """Return a connection to the pool"""
         if business_id in self.pools:
             try:
                 if error or connection.closed:
-                    # Don't return bad connections to the pool
+                    # Don't return bad/closed connections to the pool
                     connection.close()
-                    logger.warning(f"Discarded bad connection for business {business_id}")
+                    logger.warning(f"Discarded bad or closed connection for business {business_id}.")
                 else:
                     self.pools[business_id].putconn(connection)
             except Exception as e:
-                logger.error(f"Error returning connection for business {business_id}: {e}")
+                logger.error(f"Error returning connection for business {business_id}: {e}", exc_info=True)
     
     def _health_check(self, business_id: str):
         """Perform health check on a business connection"""
+        conn = None
         try:
-            connection = self.get_connection(business_id)
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT 1")
-                cursor.fetchone()
-            self.return_connection(business_id, connection)
-            logger.debug(f"Health check passed for business: {business_id}")
+            conn = self.get_connection(business_id) # This call will already handle getting a fresh conn if needed
+            if self.last_health_status[business_id] != "pass":
+                logger.info(f"Health check passed for business: {business_id}")
+            self.last_health_status[business_id] = "pass"
         except Exception as e:
-            logger.warning(f"Health check failed for business {business_id}: {e}")
+            if self.last_health_status[business_id] != "fail":
+                logger.error(f"Health check failed for business {business_id}: {e}")
+            self.last_health_status[business_id] = "fail"
             self._recreate_pool(business_id)
+        finally:
+            if conn:
+                self.return_connection(business_id, conn) # Return the connection regardless
     
     def _recreate_pool(self, business_id: str):
         """Recreate connection pool for a business"""
         with self.lock:
+            logger.info(f"Attempting to recreate connection pool for business: {business_id}")
             if business_id in self.pools:
                 try:
                     self.pools[business_id].closeall()
+                    logger.info(f"Closed old connection pool for business {business_id}.")
                 except Exception as e:
-                    logger.error(f"Error closing old pool for business {business_id}: {e}")
-                
+                    logger.error(f"Error closing old pool for business {business_id}: {e}", exc_info=True)
+                del self.pools[business_id] # Remove the old pool reference
+            
+            try:
                 self.pools[business_id] = self._create_connection_pool(business_id)
-                logger.info(f"Recreated connection pool for business: {business_id}")
-    
+                logger.info(f"Successfully recreated connection pool for business: {business_id}")
+            except Exception as e:
+                logger.error(f"Failed to recreate connection pool for business {business_id}: {e}", exc_info=True)
+                # If recreation fails, remove it from pools to indicate it's truly down
+                if business_id in self.pools:
+                    del self.pools[business_id]
+                
     def close_all_pools(self):
         """Close all connection pools"""
         with self.lock:
-            for business_id, pool in self.pools.items():
+            for business_id, pool in list(self.pools.items()): # Iterate over a copy
                 try:
                     pool.closeall()
                     logger.info(f"Closed connection pool for business: {business_id}")
                 except Exception as e:
-                    logger.error(f"Error closing pool for business {business_id}: {e}")
+                    logger.error(f"Error closing pool for business {business_id}: {e}", exc_info=True)
             self.pools.clear()
     
     def list_businesses(self) -> List[str]:
@@ -204,13 +279,17 @@ class ConnectionPoolManager:
             return {}
         
         config = self.business_configs[business_id]
+        # Return a copy without password
         return {
             "business_id": business_id,
             "host": config["host"],
             "database": config["database"],
             "port": config["port"],
             "user": config["user"],
-            "pool_status": "active" if business_id in self.pools else "inactive"
+            "pool_status": "active" if business_id in self.pools else "inactive",
+            "minconn": config.get("minconn"),
+            "maxconn": config.get("maxconn"),
+            "connect_timeout": config.get("connect_timeout"),
         }
 
 class MultiBusinessPostgreSQLServer:
@@ -227,7 +306,7 @@ class MultiBusinessPostgreSQLServer:
         try:
             return self.pool_manager.get_connection(business_id)
         except Exception as e:
-            logger.error(f"Database connection error for business {business_id}: {e}")
+            logger.error(f"Database connection error for business {business_id}: {e}", exc_info=True)
             raise
     
     def _setup_handlers(self):
@@ -357,10 +436,11 @@ class MultiBusinessPostgreSQLServer:
                 return [TextContent(type="text", text=result)]
                 
             except Exception as e:
-                logger.error(f"Tool call error for {name}: {e}")
+                logger.error(f"Tool call error for {name} with arguments {arguments}: {e}", exc_info=True)
                 return [TextContent(type="text", text=json.dumps({
                     "error": str(e),
                     "tool": name,
+                    "arguments": arguments,
                     "traceback": traceback.format_exc() if logger.level <= logging.DEBUG else None
                 }))]
     
@@ -402,8 +482,8 @@ class MultiBusinessPostgreSQLServer:
             # Get business-specific connection
             conn = self.get_db_connection(business_id)
             
-            # Add automatic LIMIT if not present
-            if 'LIMIT' not in query_upper:
+            # Add automatic LIMIT if not present (simplified check, might need regex for robustness)
+            if 'LIMIT' not in query_upper and 'FETCH FIRST' not in query_upper and 'ROWNUM' not in query_upper:
                 query += f" LIMIT {limit}"
             
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -448,7 +528,7 @@ class MultiBusinessPostgreSQLServer:
                     
         except psycopg2.Error as e:
             error_occurred = True
-            logger.error(f"Database error for business {business_id}: {e}")
+            logger.error(f"Database error executing query for business {business_id}: {e}", exc_info=True)
             return json.dumps({
                 "error": f"Database error: {str(e)}",
                 "business_id": business_id,
@@ -456,7 +536,7 @@ class MultiBusinessPostgreSQLServer:
             })
         except Exception as e:
             error_occurred = True
-            logger.error(f"Unexpected error for business {business_id}: {e}")
+            logger.error(f"Unexpected error executing query for business {business_id}: {e}", exc_info=True)
             return json.dumps({
                 "error": f"Unexpected error: {str(e)}",
                 "business_id": business_id,
@@ -494,25 +574,29 @@ class MultiBusinessPostgreSQLServer:
                 columns = cursor.fetchall()
                 if not columns:
                     return json.dumps({
-                        "error": f"Table '{table_name}' not found in business '{business_id}'",
-                        "business_id": business_id
+                        "error": f"Table '{table_name}' not found in business '{business_id}' or is not in public schema",
+                        "business_id": business_id,
+                        "table_name_attempted": table_name
                     })
                 
                 # Get primary key information
                 cursor.execute("""
-                    SELECT column_name
-                    FROM information_schema.key_column_usage
-                    WHERE table_name = %s AND table_schema = 'public'
-                    AND constraint_name IN (
-                        SELECT constraint_name
-                        FROM information_schema.table_constraints
-                        WHERE table_name = %s AND constraint_type = 'PRIMARY KEY'
-                    );
-                """, (table_name, table_name))
+                    SELECT kcu.column_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                        ON tc.constraint_name = kcu.constraint_name
+                        AND tc.table_schema = kcu.table_schema
+                        AND tc.table_name = kcu.table_name
+                    WHERE tc.constraint_type = 'PRIMARY KEY'
+                    AND tc.table_name = %s AND tc.table_schema = 'public';
+                """, (table_name,))
                 
                 primary_keys = [row[0] for row in cursor.fetchall()]
                 
                 schema_info = []
+                # `columns` is a list of tuples. psycopg2's default cursor returns tuples.
+                # If you want dict-like access, use RealDictCursor for this too or convert manually.
+                # Assuming `columns` are in the order of `SELECT` statement:
                 for col in columns:
                     col_info = {
                         "name": col[0],
@@ -535,7 +619,7 @@ class MultiBusinessPostgreSQLServer:
                     
         except Exception as e:
             error_occurred = True
-            logger.error(f"Schema error for business {business_id}: {e}")
+            logger.error(f"Schema error for business {business_id}, table {table_name}: {e}", exc_info=True)
             return json.dumps({
                 "error": f"Error getting schema: {str(e)}",
                 "business_id": business_id,
@@ -573,7 +657,7 @@ class MultiBusinessPostgreSQLServer:
                     
         except Exception as e:
             error_occurred = True
-            logger.error(f"List tables error for business {business_id}: {e}")
+            logger.error(f"List tables error for business {business_id}: {e}", exc_info=True)
             return json.dumps({
                 "error": f"Error listing tables: {str(e)}",
                 "business_id": business_id
@@ -597,7 +681,7 @@ class MultiBusinessPostgreSQLServer:
                 "count": len(business_info)
             }, indent=2)
         except Exception as e:
-            logger.error(f"List businesses error: {e}")
+            logger.error(f"List businesses error: {e}", exc_info=True)
             return json.dumps({"error": f"Error listing businesses: {str(e)}"})
     
     async def _get_business_info(self, business_id: str) -> str:
@@ -606,13 +690,13 @@ class MultiBusinessPostgreSQLServer:
             info = self.pool_manager.get_business_info(business_id)
             if not info:
                 return json.dumps({
-                    "error": f"Business '{business_id}' not found",
+                    "error": f"Business '{business_id}' not found or not configured",
                     "available_businesses": self.pool_manager.list_businesses()
                 })
             
             return json.dumps(info, indent=2)
         except Exception as e:
-            logger.error(f"Get business info error: {e}")
+            logger.error(f"Get business info error for {business_id}: {e}", exc_info=True)
             return json.dumps({"error": f"Error getting business info: {str(e)}"})
 
 async def main():
@@ -632,17 +716,17 @@ async def main():
         logger.info(f"Configured businesses: {businesses}")
         
         # Test connections to all businesses
+        logger.info("Attempting database connection tests for configured businesses...")
         for business_id in businesses:
             try:
+                # The get_db_connection method already includes a basic health check and pool management
                 conn = postgres_server.get_db_connection(business_id)
-                with conn.cursor() as cursor:
-                    cursor.execute("SELECT 1")
-                    cursor.fetchone()
                 postgres_server.pool_manager.return_connection(business_id, conn)
                 logger.info(f"Database connection test successful for business: {business_id}")
             except Exception as e:
-                logger.error(f"Database connection test failed for business {business_id}: {e}")
-                # Continue anyway - connection might be temporary issue
+                logger.error(f"Database connection test failed for business {business_id}: {e}", exc_info=True)
+                # Continue even if one fails, as other businesses might still be accessible.
+                # However, for a production setup, you might want to exit if crucial connections fail.
         
         # Run the MCP server with stdio transport
         async with stdio_server() as (read_stream, write_stream):
@@ -658,16 +742,16 @@ async def main():
             )
             
     except KeyboardInterrupt:
-        logger.info("Server shutdown requested")
+        logger.info("Server shutdown requested by user (KeyboardInterrupt).")
     except Exception as e:
-        logger.error(f"Server error: {e}")
-        traceback.print_exc()
-        sys.exit(1)
+        logger.critical(f"A critical server error occurred: {e}", exc_info=True)
+        sys.exit(1) # Exit with an error code for critical failures
     finally:
         # Clean up connection pools
         if postgres_server:
+            logger.info("Initiating connection pool closure.")
             postgres_server.pool_manager.close_all_pools()
-            logger.info("Connection pools closed")
+            logger.info("Connection pools closed.")
 
 if __name__ == "__main__":
     # Set event loop policy for Windows compatibility
@@ -676,4 +760,5 @@ if __name__ == "__main__":
         logger.info("Windows detected, setting ProactorEventLoopPolicy")
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     
+    # Run the main asynchronous function
     asyncio.run(main())

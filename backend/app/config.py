@@ -10,9 +10,7 @@ from pydantic import Field, field_validator
 from dotenv import load_dotenv
 import asyncio
 from bson import ObjectId
-from backend.app.services.vector_search import FaissVectorSearchService
-from backend.app.services.mongodb_service import MongoDBService
-from backend.app.config import Settings
+# from backend.app.services.vector_search import FaissVectorSearchService  # REMOVE this import
 from backend.app.models.business import BusinessSchema
 
 # Load environment variables
@@ -200,6 +198,7 @@ def get_redis_url() -> str:
 
 def validate_business_access(user_id: str, requested_business_id: str) -> bool:
     """Validate if user has access to the requested business by checking MongoDB user permissions."""
+    from backend.app.services.mongodb_service import mongodb_service  # Moved import here to avoid circular import
     user = asyncio.run(mongodb_service.get_user_by_id(user_id))
     if not user:
         return False

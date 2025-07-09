@@ -19,6 +19,11 @@ class PyObjectId(ObjectId):
             raise ValueError("Invalid ObjectId")
         return ObjectId(v)
 
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema, handler):
+        # Tell Pydantic to treat this as a string in OpenAPI/JSON schema
+        return {'type': 'string'}
+
 class DatabaseConfig(BaseModel):
     """Database configuration for a business"""
     host: str

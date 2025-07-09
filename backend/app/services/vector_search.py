@@ -4,10 +4,10 @@ import numpy as np
 from typing import List, Dict, Any, Optional
 from sentence_transformers import SentenceTransformer
 from backend.app.services.mongodb_service import MongoDBService
-from backend.app.config import Settings
+from backend.app.config import get_settings
 from backend.app.models.business import BusinessSchema
 
-settings = Settings()
+settings = get_settings()
 
 class FaissVectorSearchService:
     def __init__(self):
