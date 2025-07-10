@@ -14,6 +14,7 @@ from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
 from dotenv import load_dotenv, find_dotenv # Import find_dotenv for robust path finding
 import traceback
+import pymongo
 
 # MCP imports
 from mcp.server import Server
@@ -70,79 +71,40 @@ class ConnectionPoolManager:
         self._load_business_configs()
     
     def _load_business_configs(self):
-        """Load business configurations from environment variables"""
-        # Load business IDs from environment
-        business_ids_raw = os.getenv("BUSINESS_IDS")
-        logger.debug(f"DEBUG: BUSINESS_IDS raw from os.getenv: '{business_ids_raw}'")
-
-        if not business_ids_raw:
-            logger.warning("BUSINESS_IDS environment variable is not set or empty.")
-            return
-
-        # Attempt to clean BUSINESS_IDS string to remove common misconfigurations (quotes, brackets)
-        cleaned_business_ids_str = business_ids_raw.strip()
-        if cleaned_business_ids_str.startswith('[') and cleaned_business_ids_str.endswith(']'):
-            cleaned_business_ids_str = cleaned_business_ids_str[1:-1] # Remove outer brackets
-
-        # Remove any single or double quotes that might wrap individual business IDs
-        cleaned_business_ids_str = cleaned_business_ids_str.replace("'", "").replace('"', '')
-
-        # Split and strip each ID
-        business_ids = [bid.strip() for bid in cleaned_business_ids_str.split(",") if bid.strip()]
-
-        logger.info(f"DEBUG: Parsed business_ids after cleaning: {business_ids}")
-        
-        if not business_ids:
-            logger.warning("No valid business IDs found after parsing BUSINESS_IDS.")
-            return
-
-        for business_id in business_ids:
-            # Ensure business_id is clean for uppercase conversion
-            business_id = business_id.strip() 
-            if not business_id: # Skip if it resulted in an empty string
-                continue
-                
-            # Construct prefix for environment variables (e.g., BUSINESS_RESTURENT_POSTGRES_)
-            prefix_upper = f"BUSINESS_{business_id.upper()}_POSTGRES_"
-            
-            # Retrieve individual configuration values
-            host = os.getenv(f"{prefix_upper}HOST")
-            database = os.getenv(f"{prefix_upper}DB")
-            user = os.getenv(f"{prefix_upper}USER")
-            password = os.getenv(f"{prefix_upper}PASSWORD")
-            port_str = os.getenv(f"{prefix_upper}PORT", "5432") # Get as string first
-
-            # Debugging for each specific config variable
-            logger.debug(f"DEBUG: {business_id}: Attempting to fetch {prefix_upper}HOST. Result: '{host}'")
-            logger.debug(f"DEBUG: {business_id}: Attempting to fetch {prefix_upper}DB. Result: '{database}'")
-            logger.debug(f"DEBUG: {business_id}: Attempting to fetch {prefix_upper}USER. Result: '{user}'")
-            logger.debug(f"DEBUG: {business_id}: Attempting to fetch {prefix_upper}PASSWORD. Result: '{password}'")
-            logger.debug(f"DEBUG: {business_id}: Attempting to fetch {prefix_upper}PORT. Result: '{port_str}'")
-
-            config = {
-                "host": host,
-                "database": database,
-                "user": user,
-                "password": password,
-                "port": int(port_str),
-                "minconn": int(os.getenv(f"BUSINESS_{business_id.upper()}_MIN_CONNECTIONS", "2")),
-                "maxconn": int(os.getenv(f"BUSINESS_{business_id.upper()}_MAX_CONNECTIONS", "10")),
-                "connect_timeout": int(os.getenv(f"BUSINESS_{business_id.upper()}_CONNECT_TIMEOUT", "30")),
-                "keepalives": 1,
-                "keepalives_idle": 30,
-                "keepalives_interval": 10,
-                "keepalives_count": 5,
-            }
-            
-            # Validate that all required config is present
-            required_fields = ["host", "database", "user", "password"]
-            missing_fields = [field for field in required_fields if not config.get(field)]
-
-            if not missing_fields:
+        """Load business configurations from MongoDB"""
+        mongodb_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+        mongodb_db = os.getenv("MONGODB_DB", "chatbot_config")
+        try:
+            client = pymongo.MongoClient(mongodb_uri)
+            db = client[mongodb_db]
+            collection = db["business_configs"]
+            # Only load active businesses
+            docs = collection.find({"status": "active"})
+            count = 0
+            for doc in docs:
+                business_id = doc["business_id"]
+                db_config = doc["db_config"]
+                config = {
+                    "host": db_config["host"],
+                    "database": db_config["database"],
+                    "user": db_config["user"],
+                    "password": db_config["password"],
+                    "port": db_config.get("port", 5432),
+                    "minconn": 2,
+                    "maxconn": 10,
+                    "connect_timeout": 30,
+                    "keepalives": 1,
+                    "keepalives_idle": 30,
+                    "keepalives_interval": 10,
+                    "keepalives_count": 5,
+                }
                 self.business_configs[business_id] = config
-                logger.info(f"Loaded configuration for business: {business_id}")
-            else:
-                logger.warning(f"Incomplete configuration for business: '{business_id}', missing: {missing_fields}")
+                count += 1
+            logger.info(f"Loaded {count} business configs from MongoDB.")
+            logger.info(f"Loaded business configs: {list(self.business_configs.keys())}")
+        except Exception as e:
+            logger.error(f"Failed to load business configs from MongoDB: {e}")
+            raise
     
     def _create_connection_pool(self, business_id: str) -> SimpleConnectionPool:
         """Create a new connection pool for a business"""

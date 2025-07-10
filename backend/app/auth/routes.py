@@ -8,10 +8,11 @@ from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional
 import logging
+from fastapi.responses import JSONResponse
 
 from backend.app.auth.jwt_handler import jwt_handler, get_current_user, security
-from backend.app.config import get_settings, get_business_config
-from backend.app.services.mongodb_service import MongoDBService
+from backend.app.config import get_settings
+from backend.app.services.mongodb_service import mongodb_service
 from backend.app.utils import verify_password
 from fastapi_limiter.depends import RateLimiter
 
@@ -28,7 +29,7 @@ class LoginRequest(BaseModel):
     """Login request model"""
     username: str
     password: str
-    business_id: str  # Required - user must specify which business to access
+    business_id: Optional[str] = None  # Optional for admin
 
 class LoginResponse(BaseModel):
     """Login response model"""
@@ -60,30 +61,29 @@ class UserInfo(BaseModel):
 async def login(request: LoginRequest):
     """
     Login with business context.
-    User must specify which business they want to access.
+    User must specify which business they want to access, unless they are admin.
     """
     try:
-        # Validate business exists
-        try:
-            get_business_config(request.business_id)
-        except ValueError:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Business '{request.business_id}' not configured"
-            )
-
         # Use MongoDB for user authentication
-        mongo_service = MongoDBService()
+        mongo_service = mongodb_service
         await mongo_service.connect()
-        user = await mongo_service._collections['users'].find_one({
-            "username": request.username,
-            "business_id": request.business_id
-        })
+
+        # First, try to find the user by username (and business_id if provided)
+        user_query = {"username": request.username}
+        if request.business_id:
+            user_query["business_id"] = request.business_id
+        user = await mongo_service._collections['users'].find_one(user_query)
+
+        # If not found and business_id was provided, try again without business_id (for admin login)
+        if not user and not request.business_id:
+            user = await mongo_service._collections['users'].find_one({"username": request.username})
+
         if not user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials"
             )
+
         # Check user status
         if user.get("status", "active") != "active":
             raise HTTPException(
@@ -96,29 +96,58 @@ async def login(request: LoginRequest):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials"
             )
-        # Use real user info for JWT
+
         user_id = user["user_id"]
         role = user.get("role", "user")
         username = user["username"]
+
+        # For non-admins, require business_id and check allowed businesses
+        if role != "admin":
+            if not request.business_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="business_id is required for non-admin users"
+                )
+            # Validate business exists
+            try:
+                await mongodb_service.get_business_config(request.business_id)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Business '{request.business_id}' not configured"
+                )
+            # Check if user is allowed for this business
+            allowed_businesses = user.get("allowed_businesses", [])
+            if request.business_id not in allowed_businesses:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"User does not have access to business '{request.business_id}'"
+                )
+            business_id = request.business_id
+        else:
+            # For admin, allow login without business_id and set allowed_businesses
+            allowed_businesses = user.get("allowed_businesses", [])
+            business_id = request.business_id if request.business_id else None
+
         # Create tokens with business context
         access_token = jwt_handler.create_access_token(
             user_id=user_id,
-            business_id=request.business_id,
+            business_id=business_id if business_id else "all",
             username=username,
             role=role
         )
         refresh_token = jwt_handler.create_refresh_token(
             user_id=user_id,
-            business_id=request.business_id
+            business_id=business_id if business_id else "all"
         )
-        logger.info(f"User '{username}' logged into business '{request.business_id}'")
+        logger.info(f"User '{username}' logged in as '{role}'")
         return LoginResponse(
             access_token=access_token,
             refresh_token=refresh_token,
             expires_in=settings.jwt.expiration,
             user_id=user_id,
             username=username,
-            business_id=request.business_id,
+            business_id=business_id if business_id else "all",
             role=role
         )
     except HTTPException:

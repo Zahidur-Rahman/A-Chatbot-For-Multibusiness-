@@ -29,6 +29,7 @@ class MongoDBService:
     
     async def connect(self):
         """Connect to MongoDB"""
+        logger.info("MongoDBService.connect() called")
         try:
             self.client = AsyncIOMotorClient(self.settings.mongodb.uri)
             self.db = self.client[self.settings.mongodb.database]
@@ -221,6 +222,12 @@ class MongoDBService:
         """Get user by email"""
         doc = await self._collections['users'].find_one({"email": email})
         return User(**doc) if doc else None
+
+    async def get_user_by_id(self, user_id: str):
+        if not self._collections or 'users' not in self._collections:
+            await self.connect()
+        doc = await self._collections['users'].find_one({"user_id": user_id})
+        return User(**doc) if doc else None
     
     async def get_user_permissions(self, user_id: str, business_id: str) -> Optional[UserPermission]:
         """Get user permissions for a specific business"""
@@ -303,6 +310,16 @@ class MongoDBService:
         """Get conversation session by session_id"""
         doc = await self._collections['conversation_sessions'].find_one({"session_id": session_id})
         return ConversationSession(**doc) if doc else None
+    
+    async def update_conversation_session(self, session: ConversationSession) -> bool:
+        """Update an existing conversation session by session_id."""
+        update_data = session.dict(exclude={"session_id"}, exclude_unset=True)
+        update_data["updated_at"] = datetime.now(timezone.utc)
+        result = await self._collections['conversation_sessions'].update_one(
+            {"session_id": session.session_id},
+            {"$set": update_data}
+        )
+        return result.modified_count > 0
     
     async def update_conversation_memory(self, session_id: str, memory_data: Dict[str, Any]) -> bool:
         """Update conversation memory"""
@@ -408,4 +425,9 @@ class MongoDBService:
         return result.upserted_id is not None or result.modified_count > 0
 
 # Global MongoDB service instance
-mongodb_service = MongoDBService() 
+mongodb_service = MongoDBService()
+
+async def get_mongodb_service():
+    if mongodb_service.db is None or not mongodb_service._collections:
+        await mongodb_service.connect()
+    return mongodb_service 

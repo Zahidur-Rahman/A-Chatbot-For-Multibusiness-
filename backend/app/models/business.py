@@ -8,10 +8,13 @@ from pydantic import BaseModel, Field
 from bson import ObjectId
 
 class PyObjectId(ObjectId):
-    """Custom ObjectId for Pydantic compatibility"""
     @classmethod
-    def __get_validators__(cls):
-        yield cls.validate
+    def __get_pydantic_core_schema__(cls, source, handler):
+        import pydantic_core
+        return pydantic_core.core_schema.no_info_after_validator_function(
+            cls.validate,
+            handler(ObjectId)
+        )
 
     @classmethod
     def validate(cls, v):
@@ -21,8 +24,8 @@ class PyObjectId(ObjectId):
 
     @classmethod
     def __get_pydantic_json_schema__(cls, core_schema, handler):
-        # Tell Pydantic to treat this as a string in OpenAPI/JSON schema
-        return {'type': 'string'}
+        # This tells Pydantic/OpenAPI to treat it as a string in the schema
+        return {'type': 'string', 'format': 'objectid'}
 
 class DatabaseConfig(BaseModel):
     """Database configuration for a business"""
@@ -45,7 +48,7 @@ class BusinessConfig(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     
     class Config:
-        allow_population_by_field_name = True
+        validate_by_name = True
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
 
@@ -82,7 +85,7 @@ class BusinessSchema(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     
     class Config:
-        allow_population_by_field_name = True
+        validate_by_name = True
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
 

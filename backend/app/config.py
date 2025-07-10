@@ -123,41 +123,8 @@ class Settings(BaseSettings):
     features: FeatureFlags = FeatureFlags()
     mistral: MistralConfig = MistralConfig()
     
-    # Multi-business configuration
-    business_ids: List[str] = Field(default=[], env="BUSINESS_IDS")
-    business_configs: Dict[str, BusinessConfig] = {}
-    
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._load_business_configs()
-    
-    def _load_business_configs(self):
-        """Load business-specific configurations from environment variables"""
-        for business_id in self.business_ids:
-            if not business_id.strip():
-                continue
-                
-            # Load business-specific config
-            prefix = f"BUSINESS_{business_id.upper()}_"
-            config = BusinessConfig(
-                host=os.getenv(f"{prefix}POSTGRES_HOST"),
-                database=os.getenv(f"{prefix}POSTGRES_DB"),
-                user=os.getenv(f"{prefix}POSTGRES_USER"),
-                password=os.getenv(f"{prefix}POSTGRES_PASSWORD"),
-                port=int(os.getenv(f"{prefix}POSTGRES_PORT", "5432"))
-            )
-            
-            # Validate that all required config is present
-            if all([config.host, config.database, config.user, config.password]):
-                self.business_configs[business_id] = config
-            else:
-                raise ValueError(f"Incomplete configuration for business: {business_id}")
-    
-    @field_validator('business_ids', mode='before')
-    def parse_business_ids(cls, v):
-        if isinstance(v, str):
-            return [bid.strip() for bid in v.split(',') if bid.strip()]
-        return v
+    # NOTE: Per-business database configuration is NOT loaded here.
+    # It must be fetched dynamically from MongoDB at runtime via the service layer.
     
     class Config:
         env_file = ".env"
@@ -171,16 +138,11 @@ def get_settings() -> Settings:
     """Get the global settings instance"""
     return settings
 
-def get_business_config(business_id: str) -> BusinessConfig:
-    """Get configuration for a specific business"""
-    if business_id not in settings.business_configs:
-        raise ValueError(f"Business '{business_id}' not configured")
-    return settings.business_configs[business_id]
+# Remove get_business_config and business_configs logic
 
-def get_database_url(business_id: str) -> str:
-    """Get database URL for a specific business"""
-    config = get_business_config(business_id)
-    return f"postgresql://{config.user}:{config.password}@{config.host}:{config.port}/{config.database}"
+def get_database_url(business_config) -> str:
+    """Get database URL for a specific business (pass BusinessConfig object)"""
+    return f"postgresql://{business_config.user}:{business_config.password}@{business_config.host}:{business_config.port}/{business_config.database}"
 
 def get_mongodb_url() -> str:
     """Get MongoDB connection URL"""
@@ -196,13 +158,16 @@ def get_redis_url() -> str:
         return f"redis://:{config.password}@{config.host}:{config.port}/{config.db}"
     return f"redis://{config.host}:{config.port}/{config.db}"
 
-def validate_business_access(user_id: str, requested_business_id: str) -> bool:
+async def validate_business_access(user_id: str, requested_business_id: str) -> bool:
     """Validate if user has access to the requested business by checking MongoDB user permissions."""
     from backend.app.services.mongodb_service import mongodb_service  # Moved import here to avoid circular import
-    user = asyncio.run(mongodb_service.get_user_by_id(user_id))
+    user = await mongodb_service.get_user_by_id(user_id)
     if not user:
         return False
-    allowed_businesses = user.get('allowed_businesses', [])
+    # Allow super-admin access if 'all' is in allowed_businesses and user is admin
+    if user.role == 'admin' and 'all' in user.allowed_businesses:
+        return True
+    allowed_businesses = user.allowed_businesses or []
     return requested_business_id in allowed_businesses 
 
 class PyObjectId(ObjectId):

@@ -4,7 +4,8 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from fastapi import HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
-from backend.app.config import get_settings, get_business_config
+from backend.app.config import get_settings
+from backend.app.services.mongodb_service import mongodb_service
 from backend.app.models.business import BusinessConfig, BusinessSchema, BusinessConfigCreate, BusinessConfigUpdate
 from backend.app.models.user import User, UserPermission, UserSession, UserCreate, UserUpdate
 from backend.app.models.conversation import ConversationSession, ConversationAnalytics, ConversationSessionCreate

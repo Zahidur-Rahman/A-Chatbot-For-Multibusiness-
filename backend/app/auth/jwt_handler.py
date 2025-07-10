@@ -56,7 +56,7 @@ class JWTHandler:
             payload = jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
             
             # Check if token is expired
-            if datetime.now(timezone.utc) > datetime.fromtimestamp(payload["exp"]):
+            if datetime.now(timezone.utc) > datetime.fromtimestamp(payload["exp"], tz=timezone.utc):
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Token has expired"
@@ -69,7 +69,7 @@ class JWTHandler:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Token has expired"
             )
-        except jwt.JWTError:
+        except jwt.DecodeError:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token"
@@ -94,16 +94,14 @@ class JWTHandler:
             "role": payload["role"]
         }
     
-    def validate_business_access(self, user_business_id: str, 
-                               requested_business_id: str) -> bool:
+    async def validate_business_access(self, user_business_id: str, requested_business_id: str) -> bool:
         """Validate if user has access to the requested business"""
         # Use the validation function from config
-        return validate_business_access(user_business_id, requested_business_id)
+        return await validate_business_access(user_business_id, requested_business_id)
     
-    def require_business_access(self, user_business_id: str, 
-                              requested_business_id: str):
+    async def require_business_access(self, user_business_id: str, requested_business_id: str):
         """Require business access or raise HTTPException"""
-        if not self.validate_business_access(user_business_id, requested_business_id):
+        if not await self.validate_business_access(user_business_id, requested_business_id):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Access denied to business '{requested_business_id}'"
@@ -113,13 +111,13 @@ class JWTHandler:
 jwt_handler = JWTHandler()
 
 # Dependency functions for FastAPI
-async def get_current_user(credentials: HTTPAuthorizationCredentials = security):
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """FastAPI dependency to get current user"""
     return jwt_handler.get_current_user(credentials)
 
 async def require_business_access(user_business_id: str, requested_business_id: str):
     """FastAPI dependency to require business access"""
-    jwt_handler.require_business_access(user_business_id, requested_business_id)
+    await jwt_handler.require_business_access(user_business_id, requested_business_id)
 
 async def require_admin(current_user: dict = Depends(get_current_user)):
     """FastAPI dependency to require admin role"""
