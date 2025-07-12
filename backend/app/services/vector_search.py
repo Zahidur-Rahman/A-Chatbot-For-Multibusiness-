@@ -38,7 +38,7 @@ class FaissVectorSearchService:
         faiss.write_index(self.indices[business_id], path)
 
     async def index_business_schemas(self, business_id: str):
-        """Index all schemas (including relationships) for a business."""
+        """Index all schemas (including relationships) for a business with enhanced semantic text."""
         logger.info(f"[Indexing] Starting schema indexing for business: {business_id}")
         schemas: List[BusinessSchema] = await self.mongo_service.get_business_schemas(business_id)
         texts = []
@@ -47,9 +47,13 @@ class FaissVectorSearchService:
             # Combine schema description, columns, and relationships
             col_desc = ", ".join([f"{col.name}: {col.description or col.business_meaning or col.type}" for col in schema.columns])
             rel_desc = "; ".join([f"{rel.from_table}({rel.from_column}) -> {rel.to_table}({rel.to_column})" for rel in schema.relationships])
+            
+            # Pure semantic indexing - let the embedding model understand the context
             embedding_text = f"Table: {schema.table_name}. Description: {schema.schema_description}. Columns: {col_desc}. Relationships: {rel_desc}"
             texts.append(embedding_text)
             schema_ids.append(str(schema.id))
+            logger.info(f"[Indexing] Indexed table '{schema.table_name}' with pure semantic approach")
+            
         if not texts:
             logger.info(f"[Indexing] No schemas found for business: {business_id}")
             return
@@ -60,37 +64,57 @@ class FaissVectorSearchService:
         self.schema_id_map[business_id] = schema_ids
         self._save_index(business_id)
         logger.info(f"[Indexing] Finished indexing for business: {business_id}. Indexed {len(schemas)} schemas.")
+    
+    def _get_table_name_variants(self, table_name: str) -> List[str]:
+        """Pure semantic approach - let the embedding model understand table names."""
+        # No hardcoded variants - trust the embedding model's semantic understanding
+        return [table_name]
 
     async def search_schemas(self, business_id: str, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Search for relevant schemas (including relationships) for a business given a query."""
+        """Intelligent semantic search using pure vector embeddings without hardcoded rules."""
+        logger.info(f"[VectorSearch] Intelligent search for query '{query}' in business '{business_id}' with top_k={top_k}")
+        
         if business_id not in self.indices:
             self._load_index(business_id)
         if business_id not in self.indices:
+            logger.warning(f"[VectorSearch] No index found for business '{business_id}'")
             return []
 
-        # Vector search
+        # Pure semantic search - no query enhancement, no hardcoded rules
+        logger.info(f"[VectorSearch] Using pure semantic search for: '{query}'")
+        
+        # Direct vector search with original query
         query_emb = self.model.encode([query], convert_to_numpy=True)
         D, I = self.indices[business_id].search(query_emb, top_k)
         results = []
+        logger.info(f"[VectorSearch] Vector search returned {len(I[0])} results for business '{business_id}'")
+        
         for idx in I[0]:
             if idx < 0 or idx >= len(self.schema_id_map[business_id]):
                 continue
             schema_id = self.schema_id_map[business_id][idx]
-            schema = await self.mongo_service.get_business_schema(business_id, schema_id)
+            schema = await self.mongo_service.get_business_schema_by_id(business_id, schema_id)
             if schema:
                 results.append(schema.dict())
+                logger.info(f"[VectorSearch] Found schema: {schema.table_name}")
 
-        # Fallback: If no results, try keyword match on table name and schema description
-        if not results:
-            logger.info(f"[VectorSearch] No vector results for '{query}'. Trying keyword fallback.")
-            schemas = await self.mongo_service.get_business_schemas(business_id)
-            query_lower = query.lower()
-            for schema in schemas:
-                if (query_lower in schema.table_name.lower() or
-                    (schema.schema_description and query_lower in schema.schema_description.lower())):
-                    results.append(schema.dict())
-            # If still no results and query is very generic, return all schemas
-            if not results and query_lower.strip() in ["menu", "data", "table", "tables"]:
-                results = [s.dict() for s in schemas]
+        # Pure semantic search - no expansion needed, trust the embedding model
+        # The model already understands semantic relationships, synonyms, and context
 
-        return results 
+        # Pure semantic approach - no fallbacks, trust the embedding model completely
+        # If no results, it means the query doesn't semantically match any schemas
+        logger.info(f"[VectorSearch] Final result: {len(results)} schemas found for query '{query}' in business '{business_id}'")
+        return results
+    
+    async def _generate_semantic_variants(self, query: str) -> List[str]:
+        """Pure semantic approach - let the embedding model handle all variations."""
+        # No hardcoded variants - trust the embedding model's semantic understanding
+        # The vector model already understands synonyms, plurals, and semantic relationships
+        return [query]
+    
+    def _enhance_query_for_semantic_search(self, query: str) -> str:
+        """
+        Pure semantic approach - no enhancement needed.
+        The embedding model already understands semantic relationships.
+        """
+        return query 

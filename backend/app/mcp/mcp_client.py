@@ -5,6 +5,7 @@ import sys
 import threading
 import queue
 import logging
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("mcp_client")
@@ -120,7 +121,7 @@ class MCPClient:
                 }
             }
             self._request_queue.put(message)
-            timeout = 30
+            timeout = 60  # Increased from 30 to 60 seconds
             start_time = time.time()
             while time.time() - start_time < timeout:
                 try:
@@ -132,7 +133,8 @@ class MCPClient:
                             return {"error": response["error"]}
                 except queue.Empty:
                     continue
-            return {"error": "Request timeout"}
+            logger.error(f"Request timeout after {timeout} seconds for tool {tool_name}")
+            return {"error": f"Request timeout after {timeout} seconds"}
         except Exception as e:
             logger.error(f"Error calling MCP tool {tool_name}: {e}")
             return {"error": str(e)}

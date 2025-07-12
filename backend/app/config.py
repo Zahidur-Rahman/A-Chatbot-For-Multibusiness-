@@ -78,6 +78,7 @@ class ServerConfig(BaseSettings):
     port: int = Field(default=8000, env="PORT")
     debug: bool = Field(default=True, env="DEBUG")
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    show_sql_debug: bool = Field(default=False, env="SHOW_SQL_DEBUG")
     
     # CORS settings
     allowed_origins: List[str] = Field(default=["http://localhost:3000"], env="ALLOWED_ORIGINS")
@@ -106,6 +107,8 @@ class FeatureFlags(BaseSettings):
     enable_conversation_memory: bool = Field(default=True, env="ENABLE_CONVERSATION_MEMORY")
     enable_multi_business: bool = Field(default=True, env="ENABLE_MULTI_BUSINESS")
     enable_analytics: bool = Field(default=True, env="ENABLE_ANALYTICS")
+    enable_cross_session_context: bool = Field(default=False, env="ENABLE_CROSS_SESSION_CONTEXT")
+    max_conversation_context_messages: int = Field(default=10, env="MAX_CONVERSATION_CONTEXT_MESSAGES")
     
     class Config:
         env_prefix = ""
@@ -164,9 +167,12 @@ async def validate_business_access(user_id: str, requested_business_id: str) -> 
     user = await mongodb_service.get_user_by_id(user_id)
     if not user:
         return False
-    # Allow super-admin access if 'all' is in allowed_businesses and user is admin
-    if user.role == 'admin' and 'all' in user.allowed_businesses:
+    
+    # Admin users should have access to all businesses
+    if user.role == 'admin':
         return True
+    
+    # For regular users, check specific business access
     allowed_businesses = user.allowed_businesses or []
     return requested_business_id in allowed_businesses 
 
