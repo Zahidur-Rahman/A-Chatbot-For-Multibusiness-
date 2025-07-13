@@ -14,6 +14,9 @@ class Message(BaseModel):
     content: str
     timestamp: datetime = Field(default_factory=datetime.utcnow)
     metadata: Dict[str, Any] = {}  # Additional message metadata
+    
+    class Config:
+        json_encoders = {datetime: lambda v: v.isoformat()}
 
 class ConversationContext(BaseModel):
     """Conversation context for memory management"""
@@ -24,10 +27,9 @@ class ConversationContext(BaseModel):
 
 class UserPreferences(BaseModel):
     """User preferences for conversation"""
-    preferred_output_format: str = "table"  # table, chart, summary
     language: str = "en"
-    detail_level: str = "normal"  # brief, normal, detailed
-    timezone: str = "UTC"
+    response_style: str = "friendly"  # friendly, formal, concise
+    data_format: str = "table"  # table, json, csv
 
 class ConversationMemory(BaseModel):
     """Conversation memory model"""
@@ -54,6 +56,34 @@ class ConversationSession(BaseModel):
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
 
+class ConversationSessionCreate(BaseModel):
+    """Model for creating new conversation sessions"""
+    session_id: str
+    user_id: str
+    business_id: str
+    expires_at: Optional[datetime] = None
+
+class AuditLog(BaseModel):
+    """Audit log for tracking database write operations"""
+    id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
+    user_id: str = Field(index=True)
+    business_id: str = Field(index=True)
+    session_id: str = Field(index=True)
+    operation_type: str  # INSERT, UPDATE, DELETE
+    table_name: str
+    sql_query: str
+    affected_rows: Optional[int] = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+    success: bool = True
+    error_message: Optional[str] = None
+    
+    class Config:
+        validate_by_name = True
+        arbitrary_types_allowed = True
+        json_encoders = {ObjectId: str}
+
 class ConversationAnalytics(BaseModel):
     """Conversation analytics model"""
     id: Optional[PyObjectId] = Field(default_factory=PyObjectId, alias="_id")
@@ -73,12 +103,6 @@ class ConversationAnalytics(BaseModel):
         validate_by_name = True
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
-
-class ConversationSessionCreate(BaseModel):
-    """Model for creating a conversation session"""
-    user_id: str
-    business_id: str
-    expires_at: Optional[datetime] = None
 
 class ConversationSessionUpdate(BaseModel):
     """Model for updating a conversation session"""

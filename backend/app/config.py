@@ -52,7 +52,7 @@ class JWTSettings(BaseSettings):
     """JWT configuration settings"""
     secret_key: str = Field(env="JWT_SECRET_KEY")
     algorithm: str = Field(default="HS256", env="JWT_ALGORITHM")
-    expiration: int = Field(default=3600, env="JWT_EXPIRATION")
+    expiration: int = Field(default=7200, env="JWT_EXPIRATION")  # 2 hours (7200 seconds)
     refresh_expiration: int = Field(default=86400, env="JWT_REFRESH_EXPIRATION")
     
     class Config:
@@ -108,7 +108,7 @@ class FeatureFlags(BaseSettings):
     enable_multi_business: bool = Field(default=True, env="ENABLE_MULTI_BUSINESS")
     enable_analytics: bool = Field(default=True, env="ENABLE_ANALYTICS")
     enable_cross_session_context: bool = Field(default=False, env="ENABLE_CROSS_SESSION_CONTEXT")
-    max_conversation_context_messages: int = Field(default=10, env="MAX_CONVERSATION_CONTEXT_MESSAGES")
+    max_conversation_context_messages: int = Field(default=20, env="MAX_CONVERSATION_CONTEXT_MESSAGES")
     
     class Config:
         env_prefix = ""

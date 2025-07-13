@@ -23,7 +23,9 @@ from backend.app.services.business_service import router as business_admin_route
 from backend.app.services.mistral_llm_service import MistralLLMService
 from backend.app.services.vector_search import FaissVectorSearchService
 from backend.app.services.mongodb_service import MongoDBService, get_mongodb_service
+from backend.app.services.redis_service import redis_service
 from backend.app.models.conversation import ConversationSession
+from datetime import datetime
 from backend.app.mcp.mcp_client import MCPClient
 from backend.app.auth.jwt_handler import get_current_user, require_business_access, require_admin
 from fastapi_limiter import FastAPILimiter
@@ -60,6 +62,9 @@ async def lifespan(app: FastAPI):
     redis_url = f"redis://{settings.redis.host}:{settings.redis.port}/0"
     redis = await aioredis.from_url(redis_url, encoding="utf8", decode_responses=True)
     await FastAPILimiter.init(redis)
+    
+    # Initialize Redis service
+    await redis_service.connect()
     logger.info("Connected to Redis.")
 
     try:
@@ -227,6 +232,24 @@ def clean_session_id(session_id: str) -> str:
     
     logger.info(f"[CleanSessionID] Final cleaned session_id: '{cleaned}'")
     return cleaned
+
+def serialize_message_for_redis(msg) -> dict:
+    """Serialize message for Redis storage, handling datetime objects"""
+    if isinstance(msg, dict):
+        # Already a dict, just ensure datetime fields are serialized
+        serialized = {}
+        for key, value in msg.items():
+            if isinstance(value, datetime):
+                serialized[key] = value.isoformat()
+            else:
+                serialized[key] = value
+        return serialized
+    else:
+        # Message object, convert to dict and handle datetime
+        msg_dict = msg.dict()
+        if 'timestamp' in msg_dict and isinstance(msg_dict['timestamp'], datetime):
+            msg_dict['timestamp'] = msg_dict['timestamp'].isoformat()
+        return msg_dict
 
 # =============================================================================
 # CONVERSATION ENDPOINTS (Placeholder)
@@ -769,7 +792,7 @@ async def get_user_id(request: Request):
     # Fallback: use IP if user_id is not available
     return request.client.host
 
-async def is_database_related_query_dynamic(message: str, business_id: str, vector_search_service) -> bool:
+async def is_database_related_query_dynamic(message: str, business_id: str, vector_search_service, conversation_history: List = None) -> bool:
     """
     Fully LLM-based dynamic classification - no hardcoded rules.
     Uses the LLM to intelligently determine if a query should generate SQL.
@@ -787,18 +810,33 @@ async def is_database_related_query_dynamic(message: str, business_id: str, vect
         else:
             schema_context = "No relevant database schemas found."
         
-        # 3. Use LLM to classify the query
+        # 3. Use LLM to classify the query with conversation context
+        conversation_context = ""
+        if conversation_history and len(conversation_history) > 0:
+            # Get last 4 messages for context (2 exchanges)
+            recent_messages = conversation_history[-4:]
+            conversation_context = "RECENT CONVERSATION CONTEXT:\n"
+            for msg in recent_messages:
+                role = msg.get('role', msg.role if hasattr(msg, 'role') else 'unknown')
+                content = msg.get('content', msg.content if hasattr(msg, 'content') else 'unknown')
+                conversation_context += f"{role.upper()}: {content}\n"
+        else:
+            conversation_context = "No recent conversation context available."
+        
         classification_prompt = f"""
 You are an intelligent query classifier for a business chatbot system.
 
 AVAILABLE DATABASE SCHEMAS:
 {schema_context}
 
-USER QUERY: "{message}"
+{conversation_context}
+
+CURRENT USER QUERY: "{message}"
 
 TASK: Determine if this query should generate a SQL database query or be treated as general conversation.
 
 CLASSIFICATION RULES:
+**PRIMARY: Analyze the CURRENT USER QUERY first and foremost**
 - If the user is asking for specific data, records, information, or facts that could be retrieved from the database → CLASSIFY AS DATABASE QUERY
 - If the user is asking for general help, explanations, opinions, or casual conversation → CLASSIFY AS GENERAL CONVERSATION
 - If the user mentions specific names, IDs, or entities that could be looked up → CLASSIFY AS DATABASE QUERY
@@ -806,7 +844,21 @@ CLASSIFICATION RULES:
 - If the user asks "about" someone/something and relevant database tables exist → CLASSIFY AS DATABASE QUERY
 - If the user asks for information that could be found in customer, menu, or other business data → CLASSIFY AS DATABASE QUERY
 
-EXAMPLES:
+**SECONDARY: Use conversation context ONLY for clarification when the current query is ambiguous**
+- If the current query is clear and direct → IGNORE context, classify based on current query
+- If the current query uses pronouns like "them", "those", "it" → Use context to understand what they refer to
+- If the current query is a clear follow-up (e.g., "and their orders") → Use context to confirm it's continuing a database query
+- If the current query is clearly general (e.g., "hello", "thanks", "bye") → IGNORE context, classify as GENERAL CONVERSATION
+
+EXAMPLES WITH CONTEXT:
+- Previous: "show me customers" → Current: "and their orders" → DATABASE_QUERY (clear follow-up, context confirms database query)
+- Previous: "what about the menu?" → Current: "show me the prices" → DATABASE_QUERY (clear database request, context irrelevant)
+- Previous: "find John Smith" → Current: "what about his contact info?" → DATABASE_QUERY (clear database request, context confirms same person)
+- Previous: "hello" → Current: "how are you?" → GENERAL CONVERSATION (clear general conversation, context irrelevant)
+- Previous: "show me customers" → Current: "thanks, bye" → GENERAL CONVERSATION (clear general conversation, context irrelevant)
+- Previous: "show me customers" → Current: "what about them?" → DATABASE_QUERY (ambiguous pronoun, context clarifies "them" refers to customers)
+
+STANDALONE EXAMPLES:
 - "give me all information about Zahid" → DATABASE_QUERY (looking for specific customer data)
 - "About Zahid" → DATABASE_QUERY (asking about specific person, likely customer data)
 - "show me the menu" → DATABASE_QUERY (looking for menu data)
@@ -1003,27 +1055,49 @@ async def chat_endpoint(
                 if session:
                     session.cached_schema_context = schema_context
                     await mongo_service.update_conversation_session(session)
-    # Use conversation memory for context
+    # Use conversation memory for context - Redis first (1 hour TTL), then MongoDB fallback
     settings = get_settings()
     max_context_messages = settings.features.max_conversation_context_messages
     conversation_messages = []
     
-    # Get messages from current session
-    logger.info(f"[Chat] Checking session conversation memory: session={session is not None}, memory={session.conversation_memory is not None if session else False}")
-    if session and session.conversation_memory and session.conversation_memory.messages:
-        # Get last N messages from current session
-        conversation_messages = session.conversation_memory.messages[-max_context_messages:]
-        logger.info(f"[Chat] Using {len(conversation_messages)} messages from current session")
-        for i, msg in enumerate(conversation_messages):
-            logger.info(f"[Chat] Message {i+1}: {msg.role} - {msg.content[:50]}...")
-    else:
-        logger.info(f"[Chat] No conversation memory found in session")
-        if session and session.conversation_memory:
-            logger.info(f"[Chat] Session has conversation_memory but no messages: {len(session.conversation_memory.messages) if session.conversation_memory.messages else 0} messages")
-        else:
-            logger.info(f"[Chat] Session has no conversation_memory object")
+    # Try to get conversation from Redis first (1 hour TTL)
+    logger.info(f"[Chat] 🔍 Checking Redis for session: '{cleaned_session_id}' (original: '{session_id}')")
     
-            # Optionally get messages from all user sessions if enabled
+    # Check Redis connection status
+    redis_connected = await redis_service.is_connected()
+    logger.info(f"[Chat] 🔌 Redis connection status: {redis_connected}")
+    
+    cached_conversation = await redis_service.get_session_conversation(cleaned_session_id)
+    if cached_conversation and cached_conversation.get("messages"):
+        conversation_messages = cached_conversation["messages"][-max_context_messages:]
+        logger.info(f"[Chat] ✅ Using {len(conversation_messages)} messages from Redis cache (1 hour TTL)")
+        for i, msg in enumerate(conversation_messages):
+            logger.info(f"[Chat] Redis Message {i+1}: {msg.get('role')} - {msg.get('content', '')[:50]}...")
+    else:
+        # Fallback to MongoDB session
+        logger.info(f"[Chat] ❌ No Redis conversation found, falling back to MongoDB session")
+        if session and session.conversation_memory and session.conversation_memory.messages:
+            # Get last N messages from current session
+            conversation_messages = session.conversation_memory.messages[-max_context_messages:]
+            logger.info(f"[Chat] 📊 Using {len(conversation_messages)} messages from MongoDB session")
+            
+            # Cache in Redis for 1 hour TTL with proper datetime serialization
+            conversation_data = {
+                "session_id": cleaned_session_id,
+                "messages": [serialize_message_for_redis(msg) for msg in session.conversation_memory.messages],
+                "created_at": session.created_at.isoformat(),
+                "last_updated": session.last_activity.isoformat()
+            }
+            await redis_service.cache_session_conversation(cleaned_session_id, conversation_data, ttl=3600)  # 1 hour
+            logger.info(f"[Chat] Cached conversation in Redis with 1 hour TTL")
+        else:
+            logger.info(f"[Chat] No conversation memory found in session")
+            if session and session.conversation_memory:
+                logger.info(f"[Chat] Session has conversation_memory but no messages: {len(session.conversation_memory.messages) if session.conversation_memory.messages else 0} messages")
+            else:
+                logger.info(f"[Chat] Session has no conversation_memory object")
+        
+        # Optionally get messages from all user sessions if enabled
         if not conversation_messages and settings.features.enable_cross_session_context:
             # Get last N messages from all user sessions
             # For admin users without business_id, use "admin" as business_id
@@ -1073,7 +1147,14 @@ async def chat_endpoint(
     
     # Add conversation history to system prompt
     for msg in conversation_messages[:-1]:  # Exclude the current user message
-        system_prompt += f"{msg.role.upper()}: {msg.content}\n"
+        # Handle both Redis dict format and MongoDB Message object format
+        if isinstance(msg, dict):
+            role = msg.get('role', 'unknown')
+            content = msg.get('content', '')
+        else:
+            role = msg.role
+            content = msg.content
+        system_prompt += f"{role.upper()}: {content}\n"
     
     system_prompt += (
         f"\nCURRENT USER REQUEST: {request.message}\n\n"
@@ -1096,16 +1177,33 @@ async def chat_endpoint(
     
     logger.info(f"[Chat] DEBUG: Starting general conversation filtering with {len(conversation_history)} messages")
     for i, msg in enumerate(conversation_history):
-        logger.info(f"[Chat] DEBUG: General Message {i}: role='{msg.role}', last_role='{last_role}'")
-        # Only add if it has a different role than the last message we added
-        if msg.role != last_role:
-            filtered_messages.append(msg.model_dump(exclude={"metadata"}))
-            last_role = msg.role
-            logger.info(f"[Chat] DEBUG: Added general message {i} with role '{msg.role}'")
+        # Handle both Redis dict format and MongoDB Message object format
+        if isinstance(msg, dict):
+            role = msg.get('role', 'unknown')
         else:
-            logger.info(f"[Chat] DEBUG: Skipped general message {i} with role '{msg.role}' (same as last_role)")
+            role = msg.role
+            
+        logger.info(f"[Chat] DEBUG: General Message {i}: role='{role}', last_role='{last_role}'")
+        # Only add if it has a different role than the last message we added
+        if role != last_role:
+            if isinstance(msg, dict):
+                filtered_messages.append(msg)
+            else:
+                filtered_messages.append(msg.model_dump(exclude={"metadata"}))
+            last_role = role
+            logger.info(f"[Chat] DEBUG: Added general message {i} with role '{role}'")
+        else:
+            logger.info(f"[Chat] DEBUG: Skipped general message {i} with role '{role}' (same as last_role)")
     
-    logger.info(f"[Chat] Original conversation history roles: {[msg.role for msg in conversation_history]}")
+    # Get roles for logging
+    original_roles = []
+    for msg in conversation_history:
+        if isinstance(msg, dict):
+            original_roles.append(msg.get('role', 'unknown'))
+        else:
+            original_roles.append(msg.role)
+    
+    logger.info(f"[Chat] Original conversation history roles: {original_roles}")
     logger.info(f"[Chat] Filtered conversation history roles: {[msg.get('role') for msg in filtered_messages]}")
     
     # Send system prompt with conversation history embedded, plus the current user message
@@ -1113,10 +1211,31 @@ async def chat_endpoint(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": request.message}
     ]
-    # Dynamically classify message based on vector search results
+    # Dynamically classify message based on vector search results and conversation context
     # For admin users without business_id, treat as general conversation
     if business_id:
-        is_db_query = await is_database_related_query_dynamic(request.message, business_id, vector_search_service)
+        # Convert conversation history to the format expected by the classification function
+        conv_history_for_classification = []
+        if conversation_history:
+            for msg in conversation_history:
+                # Handle both Redis dict format and MongoDB Message object format
+                if isinstance(msg, dict):
+                    conv_history_for_classification.append({
+                        'role': msg.get('role', 'unknown'),
+                        'content': msg.get('content', '')
+                    })
+                else:
+                    conv_history_for_classification.append({
+                        'role': msg.role,
+                        'content': msg.content
+                    })
+        
+        is_db_query = await is_database_related_query_dynamic(
+            request.message, 
+            business_id, 
+            vector_search_service, 
+            conv_history_for_classification
+        )
     else:
         # No business_id - this is a general conversation for admin
         is_db_query = False
@@ -1134,16 +1253,40 @@ async def chat_endpoint(
             content=response
         )
         conversation_messages.append(assistant_message)
-        # Persist updated session
+        # Store conversation in both MongoDB (persistence) and Redis (1 hour TTL)
         try:
+            # MongoDB storage (persistence)
+            # Convert all messages to dict format for MongoDB
+            mongo_messages = []
+            for msg in conversation_messages:
+                if isinstance(msg, dict):
+                    mongo_messages.append(msg)
+                else:
+                    mongo_messages.append(msg.dict())
+            
             memory_data = {
-                "messages": [msg.dict() for msg in conversation_messages],
+                "messages": mongo_messages,
                 "context": session.conversation_memory.context.dict() if session.conversation_memory.context else {},
                 "user_preferences": session.conversation_memory.user_preferences.dict() if session.conversation_memory.user_preferences else {},
                 "session_variables": session.conversation_memory.session_variables or {}
             }
             await mongo_service.update_conversation_memory_upsert(cleaned_session_id, memory_data, user_id, get_storage_business_id())
-            logger.info(f"[Chat] Successfully stored conversation for session: {cleaned_session_id}")
+            
+            # Redis storage (1 hour TTL)
+            # Convert all messages to dict format for Redis with proper datetime serialization
+            redis_messages = []
+            for msg in conversation_messages:
+                redis_messages.append(serialize_message_for_redis(msg))
+            
+            conversation_data = {
+                "session_id": cleaned_session_id,
+                "messages": redis_messages,
+                "created_at": session.created_at.isoformat() if session else datetime.now().isoformat(),
+                "last_updated": datetime.now().isoformat()
+            }
+            await redis_service.update_session_conversation(cleaned_session_id, conversation_data, ttl=3600)  # 1 hour
+            
+            logger.info(f"[Chat] Successfully stored conversation in MongoDB and Redis (1 hour TTL) for session: {cleaned_session_id}")
         except Exception as e:
             logger.error(f"[Chat] Failed to store conversation for session {cleaned_session_id}: {e}")
         return ChatResponse(response=response, session_id=cleaned_session_id)
@@ -1160,13 +1303,26 @@ async def chat_endpoint(
         
         # Add conversation history to the prompt
         for msg in conversation_messages[:-1]:  # Exclude the current user message
-            sql_prompt += f"{msg.role.upper()}: {msg.content}\n"
+            # Handle both Redis dict format and MongoDB Message object format
+            if isinstance(msg, dict):
+                role = msg.get('role', 'unknown')
+                content = msg.get('content', '')
+            else:
+                role = msg.role
+                content = msg.content
+            sql_prompt += f"{role.upper()}: {content}\n"
     
         # Add context from previous conversation to help with follow-up questions
         context_hint = ""
         if len(conversation_messages) > 1:
             # Look for previous mentions of names or entities
-            previous_messages = [msg.content for msg in conversation_messages[:-1]]
+            previous_messages = []
+            for msg in conversation_messages[:-1]:
+                # Handle both Redis dict format and MongoDB Message object format
+                if isinstance(msg, dict):
+                    previous_messages.append(msg.get('content', ''))
+                else:
+                    previous_messages.append(msg.content)
             context_hint = "\nCONVERSATION CONTEXT: "
             context_hint += "The user has been discussing: " + "; ".join(previous_messages[-2:])  # Last 2 messages
             context_hint += "\n"
@@ -1174,28 +1330,28 @@ async def chat_endpoint(
         sql_prompt += (
             f"\nCURRENT USER REQUEST: {request.message}\n"
             f"{context_hint}\n"
-            "INSTRUCTIONS:\n"
-            "1. Analyze the user's natural language request\n"
-            "2. Identify relevant tables and columns from the schema above\n"
-            "3. Generate a single, safe, syntactically correct SQL SELECT query\n"
-            "4. Only use SELECT statements - never DROP, DELETE, TRUNCATE, ALTER, CREATE, INSERT, or UPDATE\n"
-            "5. Use only the tables and columns provided in the schema context\n"
-            "6. Consider the conversation history for context and follow-up questions\n"
-            "7. If this is a follow-up question, use context from previous messages to understand what the user is referring to\n\n"
-            "OUTPUT FORMAT: Generate ONLY the complete SQL query, no explanations, no markdown, no code blocks, no prefixes.\n"
-            "Preserve all SQL clauses including WHERE, ORDER BY, GROUP BY, HAVING, etc.\n"
-            "Example outputs:\n"
-            "- Simple: SELECT * FROM customers WHERE active = true;\n"
-            "- Complex: SELECT c.name, COUNT(o.id) as order_count\n"
-            "           FROM customers c\n"
-            "           LEFT JOIN orders o ON c.id = o.customer_id\n"
-            "           WHERE c.active = true\n"
-            "           GROUP BY c.id, c.name\n"
-            "           HAVING COUNT(o.id) > 0\n"
-            "           ORDER BY order_count DESC;\n"
-            "If the request cannot be handled with a SELECT query, reply: 'Operation not allowed.'\n"
-            "If no relevant tables are found in the schema, reply: 'No relevant tables found in schema.'\n\n"
-            "SQL QUERY:"
+                    "INSTRUCTIONS:\n"
+        "1. Analyze the user's natural language request\n"
+        "2. Identify relevant tables and columns from the schema above\n"
+        "3. Generate a single, safe, syntactically correct SQL query\n"
+        "4. Use SELECT, INSERT, UPDATE, or DELETE statements as appropriate\n"
+        "5. For INSERT: Generate valid INSERT statements with proper values\n"
+        "6. For UPDATE: Generate UPDATE statements with WHERE clauses to target specific records\n"
+        "7. For DELETE: Generate DELETE statements with WHERE clauses to target specific records\n"
+        "8. Never use DROP, TRUNCATE, or ALTER statements\n"
+        "9. Use only the tables and columns provided in the schema context\n"
+        "10. Consider the conversation history for context and follow-up questions\n"
+        "11. If this is a follow-up question, use context from previous messages to understand what the user is referring to\n\n"
+        "OUTPUT FORMAT: Generate ONLY the complete SQL query, no explanations, no markdown, no code blocks, no prefixes.\n"
+        "Preserve all SQL clauses including WHERE, ORDER BY, GROUP BY, HAVING, etc.\n"
+        "Example outputs:\n"
+        "- SELECT: SELECT * FROM customers WHERE active = true;\n"
+        "- INSERT: INSERT INTO customers (name, email, phone) VALUES ('John Doe', 'john@example.com', '1234567890');\n"
+        "- UPDATE: UPDATE customers SET phone = '0987654321' WHERE id = 1;\n"
+        "- DELETE: DELETE FROM customers WHERE id = 1;\n"
+        "If the request cannot be handled with a valid SQL query, reply: 'Operation not allowed.'\n"
+        "If no relevant tables are found in the schema, reply: 'No relevant tables found in schema.'\n\n"
+        "SQL QUERY:"
         )
         logger.info(f"[Chat] sql_prompt for message '{request.message}': {sql_prompt}")
         
@@ -1210,16 +1366,33 @@ async def chat_endpoint(
         
         logger.info(f"[Chat] DEBUG: Starting filtering with {len(conversation_history)} messages")
         for i, msg in enumerate(conversation_history):
-            logger.info(f"[Chat] DEBUG: Message {i}: role='{msg.role}', last_role='{last_role}'")
-            # Only add if it has a different role than the last message we added
-            if msg.role != last_role:
-                filtered_messages.append(msg.model_dump(exclude={"metadata"}))
-                last_role = msg.role
-                logger.info(f"[Chat] DEBUG: Added message {i} with role '{msg.role}'")
+            # Handle both Redis dict format and MongoDB Message object format
+            if isinstance(msg, dict):
+                role = msg.get('role', 'unknown')
             else:
-                logger.info(f"[Chat] DEBUG: Skipped message {i} with role '{msg.role}' (same as last_role)")
+                role = msg.role
+                
+            logger.info(f"[Chat] DEBUG: Message {i}: role='{role}', last_role='{last_role}'")
+            # Only add if it has a different role than the last message we added
+            if role != last_role:
+                if isinstance(msg, dict):
+                    filtered_messages.append(msg)
+                else:
+                    filtered_messages.append(msg.model_dump(exclude={"metadata"}))
+                last_role = role
+                logger.info(f"[Chat] DEBUG: Added message {i} with role '{role}'")
+            else:
+                logger.info(f"[Chat] DEBUG: Skipped message {i} with role '{role}' (same as last_role)")
         
-        logger.info(f"[Chat] Original conversation history roles: {[msg.role for msg in conversation_history]}")
+        # Get roles for logging
+        original_roles = []
+        for msg in conversation_history:
+            if isinstance(msg, dict):
+                original_roles.append(msg.get('role', 'unknown'))
+            else:
+                original_roles.append(msg.role)
+        
+        logger.info(f"[Chat] Original conversation history roles: {original_roles}")
         logger.info(f"[Chat] Filtered conversation history roles: {[msg.get('role') for msg in filtered_messages]}")
         
         logger.info(f"[Chat] Using {len(filtered_messages)} filtered messages for SQL generation")
@@ -1281,14 +1454,41 @@ async def chat_endpoint(
             )
             conversation_messages.append(assistant_message)
             try:
+                # MongoDB storage (persistence)
+                # Convert all messages to dict format for MongoDB
+                mongo_messages = []
+                for msg in conversation_messages:
+                    if isinstance(msg, dict):
+                        mongo_messages.append(msg)
+                    else:
+                        mongo_messages.append(msg.dict())
+                
                 memory_data = {
-                    "messages": [msg.dict() for msg in conversation_messages],
+                    "messages": mongo_messages,
                     "context": session.conversation_memory.context.dict() if session.conversation_memory.context else {},
                     "user_preferences": session.conversation_memory.user_preferences.dict() if session.conversation_memory.user_preferences else {},
                     "session_variables": session.conversation_memory.session_variables or {}
                 }
                 await mongo_service.update_conversation_memory_upsert(cleaned_session_id, memory_data, user_id, get_storage_business_id())
-                logger.info(f"[Chat] Successfully stored conversation for session: {cleaned_session_id}")
+                
+                # Redis storage (1 hour TTL)
+                # Convert all messages to dict format for Redis
+                redis_messages = []
+                for msg in conversation_messages:
+                    if isinstance(msg, dict):
+                        redis_messages.append(msg)
+                    else:
+                        redis_messages.append(msg.dict())
+                
+                conversation_data = {
+                    "session_id": cleaned_session_id,
+                    "messages": redis_messages,
+                    "created_at": session.created_at.isoformat() if session else datetime.now().isoformat(),
+                    "last_updated": datetime.now().isoformat()
+                }
+                await redis_service.update_session_conversation(cleaned_session_id, conversation_data, ttl=3600)  # 1 hour
+                
+                logger.info(f"[Chat] Successfully stored conversation in MongoDB and Redis (1 hour TTL) for session: {cleaned_session_id}")
             except Exception as e:
                 logger.error(f"[Chat] Failed to store conversation for session {cleaned_session_id}: {e}")
             return ChatResponse(response="Operation not allowed.", session_id=cleaned_session_id)
@@ -1300,20 +1500,100 @@ async def chat_endpoint(
             )
             conversation_messages.append(assistant_message)
             try:
+                # MongoDB storage (persistence)
+                # Convert all messages to dict format for MongoDB
+                mongo_messages = []
+                for msg in conversation_messages:
+                    if isinstance(msg, dict):
+                        mongo_messages.append(msg)
+                    else:
+                        mongo_messages.append(msg.dict())
+                
                 memory_data = {
-                    "messages": [msg.dict() for msg in conversation_messages],
+                    "messages": mongo_messages,
                     "context": session.conversation_memory.context.dict() if session.conversation_memory.context else {},
                     "user_preferences": session.conversation_memory.user_preferences.dict() if session.conversation_memory.user_preferences else {},
                     "session_variables": session.conversation_memory.session_variables or {}
                 }
                 await mongo_service.update_conversation_memory_upsert(cleaned_session_id, memory_data, user_id, get_storage_business_id())
-                logger.info(f"[Chat] Successfully stored conversation for session: {cleaned_session_id}")
+                
+                # Redis storage (1 hour TTL)
+                # Convert all messages to dict format for Redis with proper datetime serialization
+                redis_messages = []
+                for msg in conversation_messages:
+                    redis_messages.append(serialize_message_for_redis(msg))
+                
+                conversation_data = {
+                    "session_id": cleaned_session_id,
+                    "messages": redis_messages,
+                    "created_at": session.created_at.isoformat() if session else datetime.now().isoformat(),
+                    "last_updated": datetime.now().isoformat()
+                }
+                await redis_service.update_session_conversation(cleaned_session_id, conversation_data, ttl=3600)  # 1 hour
+                
+                logger.info(f"[Chat] Successfully stored conversation in MongoDB and Redis (1 hour TTL) for session: {cleaned_session_id}")
             except Exception as e:
                 logger.error(f"[Chat] Failed to store conversation for session {cleaned_session_id}: {e}")
             return ChatResponse(response="I couldn't find any relevant database tables for your query. Please try rephrasing your request or contact support if you believe this is an error.", session_id=cleaned_session_id)
+        # Check if this is a write operation for audit logging
+        is_write_operation = any(keyword in sql_query.upper() for keyword in ['INSERT', 'UPDATE', 'DELETE'])
+        operation_type = None
+        table_name = None
+        
+        if is_write_operation:
+            # Extract operation type and table name for audit logging
+            sql_upper = sql_query.upper().strip()
+            if sql_upper.startswith('INSERT'):
+                operation_type = 'INSERT'
+                # Extract table name from INSERT INTO table_name
+                if 'INTO' in sql_upper:
+                    parts = sql_upper.split('INTO')
+                    if len(parts) > 1:
+                        table_part = parts[1].strip().split()[0]
+                        table_name = table_part.strip(';')
+            elif sql_upper.startswith('UPDATE'):
+                operation_type = 'UPDATE'
+                # Extract table name from UPDATE table_name
+                parts = sql_upper.split('UPDATE')
+                if len(parts) > 1:
+                    table_part = parts[1].strip().split()[0]
+                    table_name = table_part.strip(';')
+            elif sql_upper.startswith('DELETE'):
+                operation_type = 'DELETE'
+                # Extract table name from DELETE FROM table_name
+                if 'FROM' in sql_upper:
+                    parts = sql_upper.split('FROM')
+                    if len(parts) > 1:
+                        table_part = parts[1].strip().split()[0]
+                        table_name = table_part.strip(';')
+        
         # Execute SQL query via MCP
         logger.info(f"[Chat] Executing SQL via MCP: '{sql_query}' for business '{business_id}'")
         mcp_result = await mcp_client.execute_query(sql_query, business_id)
+        
+        # Log audit entry for write operations
+        if is_write_operation and operation_type and table_name:
+            try:
+                from backend.app.models.conversation import AuditLog
+                from fastapi import Request
+                
+                # Create audit log entry
+                audit_log = AuditLog(
+                    user_id=user_id,
+                    business_id=business_id,
+                    session_id=cleaned_session_id,
+                    operation_type=operation_type,
+                    table_name=table_name,
+                    sql_query=sql_query,
+                    success=not (isinstance(mcp_result, dict) and "error" in mcp_result),
+                    error_message=mcp_result.get('error') if isinstance(mcp_result, dict) and "error" in mcp_result else None
+                )
+                
+                await mongo_service.create_audit_log(audit_log)
+                logger.info(f"[Chat] Audit log created for {operation_type} operation on table {table_name}")
+                
+            except Exception as audit_error:
+                logger.error(f"[Chat] Failed to create audit log: {audit_error}")
         
         if isinstance(mcp_result, dict) and "error" in mcp_result:
             error_msg = mcp_result['error']
@@ -1333,14 +1613,38 @@ async def chat_endpoint(
             )
             conversation_messages.append(assistant_message)
             try:
+                # MongoDB storage (persistence)
+                # Convert all messages to dict format for MongoDB
+                mongo_messages = []
+                for msg in conversation_messages:
+                    if isinstance(msg, dict):
+                        mongo_messages.append(msg)
+                    else:
+                        mongo_messages.append(msg.dict())
+                
                 memory_data = {
-                    "messages": [msg.dict() for msg in conversation_messages],
+                    "messages": mongo_messages,
                     "context": session.conversation_memory.context.dict() if session.conversation_memory.context else {},
                     "user_preferences": session.conversation_memory.user_preferences.dict() if session.conversation_memory.user_preferences else {},
                     "session_variables": session.conversation_memory.session_variables or {}
                 }
                 await mongo_service.update_conversation_memory_upsert(cleaned_session_id, memory_data, user_id, get_storage_business_id())
-                logger.info(f"[Chat] Successfully stored conversation for session: {cleaned_session_id}")
+                
+                # Redis storage (1 hour TTL)
+                # Convert all messages to dict format for Redis with proper datetime serialization
+                redis_messages = []
+                for msg in conversation_messages:
+                    redis_messages.append(serialize_message_for_redis(msg))
+                
+                conversation_data = {
+                    "session_id": cleaned_session_id,
+                    "messages": redis_messages,
+                    "created_at": session.created_at.isoformat() if session else datetime.now().isoformat(),
+                    "last_updated": datetime.now().isoformat()
+                }
+                await redis_service.update_session_conversation(cleaned_session_id, conversation_data, ttl=3600)  # 1 hour
+                
+                logger.info(f"[Chat] Successfully stored conversation in MongoDB and Redis (1 hour TTL) for session: {cleaned_session_id}")
             except Exception as e:
                 logger.error(f"[Chat] Failed to store conversation for session {cleaned_session_id}: {e}")
             return ChatResponse(response=f"I encountered an error while executing your query: {user_error}", session_id=cleaned_session_id)
@@ -1407,10 +1711,19 @@ async def chat_endpoint(
         conversation_messages.append(assistant_message)
         logger.info(f"[Chat] About to store {len(conversation_messages)} messages in session")
         
-        # Update conversation memory directly
+        # Store conversation in both MongoDB (persistence) and Redis (1 hour TTL)
         try:
+            # MongoDB storage (persistence)
+            # Convert all messages to dict format for MongoDB
+            mongo_messages = []
+            for msg in conversation_messages:
+                if isinstance(msg, dict):
+                    mongo_messages.append(msg)
+                else:
+                    mongo_messages.append(msg.dict())
+            
             memory_data = {
-                "messages": [msg.dict() for msg in conversation_messages],
+                "messages": mongo_messages,
                 "context": session.conversation_memory.context.dict() if session.conversation_memory.context else {},
                 "user_preferences": session.conversation_memory.user_preferences.dict() if session.conversation_memory.user_preferences else {},
                 "session_variables": session.conversation_memory.session_variables or {}
@@ -1418,7 +1731,22 @@ async def chat_endpoint(
             # Use the cleaned session_id for storage, not the original escaped one
             result = await mongo_service.update_conversation_memory_upsert(cleaned_session_id, memory_data, user_id, get_storage_business_id())
             logger.info(f"[Chat] MongoDB memory update result: {result}")
-            logger.info(f"[Chat] Successfully stored conversation for session: {cleaned_session_id}")
+            
+            # Redis storage (1 hour TTL)
+            # Convert all messages to dict format for Redis with proper datetime serialization
+            redis_messages = []
+            for msg in conversation_messages:
+                redis_messages.append(serialize_message_for_redis(msg))
+            
+            conversation_data = {
+                "session_id": cleaned_session_id,
+                "messages": redis_messages,
+                "created_at": session.created_at.isoformat() if session else datetime.now().isoformat(),
+                "last_updated": datetime.now().isoformat()
+            }
+            await redis_service.update_session_conversation(cleaned_session_id, conversation_data, ttl=3600)  # 1 hour
+            
+            logger.info(f"[Chat] Successfully stored conversation in MongoDB and Redis (1 hour TTL) for session: {cleaned_session_id}")
         except Exception as e:
             logger.error(f"[Chat] Failed to store conversation for session {cleaned_session_id}: {e}")
             logger.error(f"[Chat] Exception details: {type(e).__name__}: {str(e)}")
@@ -1433,6 +1761,19 @@ async def debug_generate_sql(
     """Debug endpoint to test SQL generation without execution"""
     user_id = current_user["user_id"]
     business_id = current_user["business_id"]
+    
+    # First, classify the query using the same logic as the main chat endpoint
+    is_db_query = await is_database_related_query_dynamic(request.message, business_id, vector_search_service, [])
+    
+    if not is_db_query:
+        # This is a general conversation, not a database query
+        return {
+            "business_id": business_id,
+            "user_message": request.message,
+            "classification": "GENERAL_CONVERSATION",
+            "message": "This is a general conversation query, not a database query. Use the main /chat endpoint for general conversations.",
+            "should_generate_sql": False
+        }
     
     # Get schema context
     schema_context = await vector_search_service.search_schemas(business_id, request.message, top_k=5)
@@ -1450,24 +1791,36 @@ async def debug_generate_sql(
     # Generate SQL prompt
     sql_prompt = (
         "You are an expert SQL assistant for a PostgreSQL database. "
-        "Your task is to convert natural language requests into SQL SELECT queries.\n\n"
+        "Your task is to convert natural language requests into SQL queries.\n\n"
         "AVAILABLE DATABASE SCHEMAS:\n{schema_text}\n"
         "CURRENT USER REQUEST: {request.message}\n\n"
         "INSTRUCTIONS:\n"
         "1. Analyze the user's natural language request\n"
         "2. Identify relevant tables and columns from the schema above\n"
-        "3. Generate a single, safe, syntactically correct SQL SELECT query\n"
-        "4. Only use SELECT statements - never DROP, DELETE, TRUNCATE, ALTER, CREATE, INSERT, or UPDATE\n"
-        "5. Use only the tables and columns provided in the schema context\n\n"
+        "3. Generate a single, safe, syntactically correct SQL query\n"
+        "4. Use SELECT, INSERT, UPDATE, or DELETE statements as appropriate\n"
+        "5. For INSERT: Generate valid INSERT statements with proper values\n"
+        "6. For UPDATE: Generate UPDATE statements with WHERE clauses to target specific records\n"
+        "7. For DELETE: Generate DELETE statements with WHERE clauses to target specific records\n"
+        "8. Never use DROP, TRUNCATE, or ALTER statements\n"
+        "9. Use only the tables and columns provided in the schema context\n\n"
         "OUTPUT FORMAT: Generate ONLY the complete SQL query, no explanations, no markdown, no code blocks, no prefixes.\n"
         "Preserve all SQL clauses including WHERE, ORDER BY, GROUP BY, HAVING, etc.\n"
-        "If the request cannot be handled with a SELECT query, reply: 'Operation not allowed.'\n"
+        "Example outputs:\n"
+        "- SELECT: SELECT * FROM customers WHERE active = true;\n"
+        "- INSERT: INSERT INTO customers (name, email, phone) VALUES ('John Doe', 'john@example.com', '1234567890');\n"
+        "- UPDATE: UPDATE customers SET phone = '0987654321' WHERE id = 1;\n"
+        "- DELETE: DELETE FROM customers WHERE id = 1;\n"
+        "If the request cannot be handled with a valid SQL query, reply: 'Operation not allowed.'\n"
         "If no relevant tables are found in the schema, reply: 'No relevant tables found in schema.'\n\n"
         "SQL QUERY:"
     )
     
     # Generate SQL
-    sql_response = await llm_service.chat([{"role": "system", "content": sql_prompt}])
+    sql_response = await llm_service.chat([
+        {"role": "system", "content": sql_prompt},
+        {"role": "user", "content": request.message}
+    ])
     
     # Clean SQL (same logic as main endpoint)
     sql_query = sql_response.strip()
@@ -1501,9 +1854,124 @@ async def debug_generate_sql(
     return {
         "business_id": business_id,
         "user_message": request.message,
+        "classification": "DATABASE_QUERY",
         "raw_llm_response": sql_response,
         "cleaned_sql": sql_query,
-        "schema_context": [s.get('table_name') for s in schema_context]
+        "schema_context": [s.get('table_name') for s in schema_context],
+        "should_generate_sql": True
+    }
+
+@app.get("/debug/redis-conversation/{session_id}")
+async def debug_redis_conversation(
+    session_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Debug endpoint to check Redis conversation cache"""
+    # Clean session ID to handle Swagger UI escaping
+    cleaned_session_id = clean_session_id(session_id)
+    
+    # Get conversation from Redis
+    cached_conversation = await redis_service.get_session_conversation(cleaned_session_id)
+    
+    if cached_conversation:
+        # Get TTL
+        ttl = await redis_service.get_session_ttl(cleaned_session_id)
+        
+        return {
+            "session_id": cleaned_session_id,
+            "found_in_redis": True,
+            "ttl_seconds": ttl,
+            "message_count": len(cached_conversation.get("messages", [])),
+            "created_at": cached_conversation.get("created_at"),
+            "last_updated": cached_conversation.get("last_updated"),
+            "messages": cached_conversation.get("messages", [])
+        }
+    else:
+        return {
+            "session_id": cleaned_session_id,
+            "found_in_redis": False,
+            "message": "No conversation found in Redis cache"
+        }
+
+@app.get("/debug/redis-stats")
+async def debug_redis_stats(
+    current_user: dict = Depends(get_current_user)
+):
+    """Debug endpoint to check Redis cache statistics"""
+    stats = await redis_service.get_cache_stats()
+    return stats
+
+@app.get("/debug/conversation-source/{session_id}")
+async def debug_conversation_source(
+    session_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Debug endpoint to check where conversation data comes from (Redis vs MongoDB)"""
+    # Clean session ID to handle Swagger UI escaping
+    cleaned_session_id = clean_session_id(session_id)
+    
+    # Check Redis first
+    cached_conversation = await redis_service.get_session_conversation(cleaned_session_id)
+    redis_has_data = cached_conversation and cached_conversation.get("messages")
+    
+    # Check MongoDB
+    mongo_service = get_mongodb_service()
+    session = await mongo_service.get_conversation_session(cleaned_session_id)
+    mongo_has_data = session and session.conversation_memory and session.conversation_memory.messages
+    
+    return {
+        "session_id": cleaned_session_id,
+        "redis_has_data": redis_has_data,
+        "redis_message_count": len(cached_conversation.get("messages", [])) if cached_conversation else 0,
+        "redis_ttl": await redis_service.get_session_ttl(cleaned_session_id) if redis_has_data else None,
+        "mongo_has_data": mongo_has_data,
+        "mongo_message_count": len(session.conversation_memory.messages) if mongo_has_data else 0,
+        "conversation_source": "Redis" if redis_has_data else "MongoDB" if mongo_has_data else "None",
+        "recommended_source": "Redis (faster)" if redis_has_data else "MongoDB (persistent)" if mongo_has_data else "No data"
+    }
+
+@app.get("/debug/audit-logs")
+async def debug_audit_logs(
+    user_id: Optional[str] = None,
+    business_id: Optional[str] = None,
+    operation_type: Optional[str] = None,
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user),
+    mongo_service: MongoDBService = Depends(get_mongodb_service)
+):
+    """Debug endpoint to view audit logs"""
+    # Only admins can view audit logs
+    if current_user["role"] != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only administrators can view audit logs"
+        )
+    
+    logs = await mongo_service.get_audit_logs(
+        user_id=user_id,
+        business_id=business_id,
+        operation_type=operation_type,
+        limit=limit
+    )
+    
+    return {
+        "audit_logs": [
+            {
+                "id": str(log.id),
+                "user_id": log.user_id,
+                "business_id": log.business_id,
+                "session_id": log.session_id,
+                "operation_type": log.operation_type,
+                "table_name": log.table_name,
+                "sql_query": log.sql_query,
+                "affected_rows": log.affected_rows,
+                "timestamp": log.timestamp.isoformat(),
+                "success": log.success,
+                "error_message": log.error_message
+            }
+            for log in logs
+        ],
+        "total_count": len(logs)
     }
 
 if __name__ == "__main__":

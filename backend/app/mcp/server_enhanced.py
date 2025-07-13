@@ -420,32 +420,41 @@ class MultiBusinessPostgreSQLServer:
             # Validate limit
             limit = max(1, min(limit, 10000))
             
-            # Security check - only allow SELECT statements
-            if not query.upper().startswith('SELECT'):
+            # Security check - allow SELECT, INSERT, UPDATE, DELETE statements
+            query_upper = query.upper().strip()
+            allowed_operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE']
+            operation_found = any(query_upper.startswith(op) for op in allowed_operations)
+            
+            if not operation_found:
                 return json.dumps({
-                    "error": "Only SELECT queries are allowed for security reasons",
+                    "error": "Only SELECT, INSERT, UPDATE, and DELETE queries are allowed for security reasons",
                     "provided_query": query[:100] + "..." if len(query) > 100 else query
                 })
             
-            # Check for dangerous patterns
+            # Check for dangerous patterns (only block destructive operations)
+            # Use word boundaries to avoid false positives with SQL functions
             dangerous_patterns = [
-                'DROP', 'DELETE', 'TRUNCATE', 'ALTER', 'CREATE', 'INSERT', 'UPDATE',
-                'GRANT', 'REVOKE', 'COPY', 'CALL', 'EXECUTE', 'IMPORT', 'EXPORT'
+                r'\bDROP\b', r'\bTRUNCATE\b', r'\bALTER\b', r'\bCREATE\b',
+                r'\bGRANT\b', r'\bREVOKE\b', r'\bCOPY\b', r'\bCALL\b', r'\bEXECUTE\b', r'\bIMPORT\b', r'\bEXPORT\b'
             ]
             
+            import re
             query_upper = query.upper()
             for pattern in dangerous_patterns:
-                if pattern in query_upper:
+                if re.search(pattern, query_upper):
                     return json.dumps({
-                        "error": f"Query contains forbidden keyword: {pattern}",
+                        "error": f"Query contains forbidden keyword: {pattern.replace(r'\b', '')}",
                         "provided_query": query[:100] + "..." if len(query) > 100 else query
                     })
             
             # Get business-specific connection
             conn = self.get_db_connection(business_id)
             
-            # Add automatic LIMIT if not present (simplified check, might need regex for robustness)
-            if 'LIMIT' not in query_upper and 'FETCH FIRST' not in query_upper and 'ROWNUM' not in query_upper:
+            # Handle different operation types
+            is_select = query_upper.startswith('SELECT')
+            
+            # Add automatic LIMIT only for SELECT queries
+            if is_select and 'LIMIT' not in query_upper and 'FETCH FIRST' not in query_upper and 'ROWNUM' not in query_upper:
                 query += f" LIMIT {limit}"
             
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -456,37 +465,52 @@ class MultiBusinessPostgreSQLServer:
                 cursor.execute(query)
                 execution_time = time.time() - start_time
                 
-                results = cursor.fetchall()
-                
-                # Convert to JSON-serializable format
-                json_results = []
-                for row in results:
-                    json_row = {}
-                    for key, value in row.items():
-                        # Handle special types that aren't JSON serializable
-                        if hasattr(value, 'isoformat'):  # datetime objects
-                            json_row[key] = value.isoformat()
-                        elif isinstance(value, (bytes, memoryview)):
-                            json_row[key] = str(value)
-                        elif hasattr(value, '__class__') and value.__class__.__name__ == 'Decimal':
-                            # Handle Decimal objects from PostgreSQL NUMERIC/DECIMAL columns
-                            json_row[key] = float(value)
-                        elif isinstance(value, (int, float, str, bool, type(None))):
-                            # Basic JSON-serializable types
-                            json_row[key] = value
-                        else:
-                            # Fallback for any other non-serializable types
-                            json_row[key] = str(value)
-                    json_results.append(json_row)
-                
-                return json.dumps({
-                    "success": True,
-                    "business_id": business_id,
-                    "query": query,
-                    "row_count": len(json_results),
-                    "execution_time_seconds": round(execution_time, 3),
-                    "results": json_results
-                }, indent=2)
+                if is_select:
+                    # Handle SELECT queries - fetch results
+                    results = cursor.fetchall()
+                    
+                    # Convert to JSON-serializable format
+                    json_results = []
+                    for row in results:
+                        json_row = {}
+                        for key, value in row.items():
+                            # Handle special types that aren't JSON serializable
+                            if hasattr(value, 'isoformat'):  # datetime objects
+                                json_row[key] = value.isoformat()
+                            elif isinstance(value, (bytes, memoryview)):
+                                json_row[key] = str(value)
+                            elif hasattr(value, '__class__') and value.__class__.__name__ == 'Decimal':
+                                # Handle Decimal objects from PostgreSQL NUMERIC/DECIMAL columns
+                                json_row[key] = float(value)
+                            elif isinstance(value, (int, float, str, bool, type(None))):
+                                # Basic JSON-serializable types
+                                json_row[key] = value
+                            else:
+                                # Fallback for any other non-serializable types
+                                json_row[key] = str(value)
+                        json_results.append(json_row)
+                    
+                    return json.dumps({
+                        "success": True,
+                        "business_id": business_id,
+                        "query": query,
+                        "row_count": len(json_results),
+                        "execution_time_seconds": round(execution_time, 3),
+                        "results": json_results
+                    }, indent=2)
+                else:
+                    # Handle INSERT, UPDATE, DELETE queries - get affected rows
+                    affected_rows = cursor.rowcount
+                    conn.commit()  # Commit the transaction for write operations
+                    
+                    return json.dumps({
+                        "success": True,
+                        "business_id": business_id,
+                        "query": query,
+                        "affected_rows": affected_rows,
+                        "execution_time_seconds": round(execution_time, 3),
+                        "operation_type": "INSERT" if query_upper.startswith('INSERT') else "UPDATE" if query_upper.startswith('UPDATE') else "DELETE"
+                    }, indent=2)
                     
         except psycopg2.Error as e:
             error_occurred = True

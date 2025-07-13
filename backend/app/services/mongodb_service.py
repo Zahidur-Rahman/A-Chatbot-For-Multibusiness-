@@ -14,7 +14,7 @@ from pymongo.errors import DuplicateKeyError
 from backend.app.config import get_settings
 from backend.app.models.business import BusinessConfig, BusinessSchema, BusinessConfigCreate, BusinessConfigUpdate
 from backend.app.models.user import User, UserPermission, UserSession, UserCreate, UserUpdate
-from backend.app.models.conversation import ConversationSession, ConversationAnalytics, ConversationSessionCreate
+from backend.app.models.conversation import ConversationSession, ConversationAnalytics, ConversationSessionCreate, AuditLog
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,8 @@ class MongoDBService:
                 'user_permissions': self.db.user_permissions,
                 'user_sessions': self.db.user_sessions,
                 'conversation_sessions': self.db.conversation_sessions,
-                'conversation_analytics': self.db.conversation_analytics
+                'conversation_analytics': self.db.conversation_analytics,
+                'audit_logs': self.db.audit_logs
             }
             
             # Create indexes
@@ -95,6 +96,14 @@ class MongoDBService:
             await self._collections['conversation_analytics'].create_index([("session_id", ASCENDING)], unique=True)
             await self._collections['conversation_analytics'].create_index([("user_id", ASCENDING)])
             await self._collections['conversation_analytics'].create_index([("business_id", ASCENDING)])
+            
+            # Audit logs indexes
+            await self._collections['audit_logs'].create_index([("user_id", ASCENDING)])
+            await self._collections['audit_logs'].create_index([("business_id", ASCENDING)])
+            await self._collections['audit_logs'].create_index([("session_id", ASCENDING)])
+            await self._collections['audit_logs'].create_index([("operation_type", ASCENDING)])
+            await self._collections['audit_logs'].create_index([("table_name", ASCENDING)])
+            await self._collections['audit_logs'].create_index([("timestamp", DESCENDING)])
             
             logger.info("Database indexes created successfully")
             
@@ -555,6 +564,46 @@ class MongoDBService:
             upsert=True
         )
         return result.upserted_id is not None or result.modified_count > 0
+
+    # =============================================================================
+    # AUDIT LOGGING METHODS
+    # =============================================================================
+    
+    async def create_audit_log(self, audit_log: AuditLog) -> AuditLog:
+        """Create a new audit log entry"""
+        try:
+            result = await self._collections['audit_logs'].insert_one(audit_log.dict(by_alias=True))
+            audit_log.id = result.inserted_id
+            logger.info(f"Created audit log for user {audit_log.user_id}, operation: {audit_log.operation_type}")
+            return audit_log
+        except Exception as e:
+            logger.error(f"Failed to create audit log: {e}")
+            raise
+    
+    async def get_audit_logs(self, user_id: Optional[str] = None, business_id: Optional[str] = None, 
+                           operation_type: Optional[str] = None, limit: int = 100) -> List[AuditLog]:
+        """Get audit logs with optional filtering"""
+        filter_dict = {}
+        if user_id:
+            filter_dict["user_id"] = user_id
+        if business_id:
+            filter_dict["business_id"] = business_id
+        if operation_type:
+            filter_dict["operation_type"] = operation_type
+        
+        cursor = self._collections['audit_logs'].find(filter_dict).sort("timestamp", DESCENDING).limit(limit)
+        logs = []
+        async for doc in cursor:
+            logs.append(AuditLog(**doc))
+        return logs
+    
+    async def get_audit_logs_by_session(self, session_id: str, limit: int = 50) -> List[AuditLog]:
+        """Get audit logs for a specific session"""
+        cursor = self._collections['audit_logs'].find({"session_id": session_id}).sort("timestamp", DESCENDING).limit(limit)
+        logs = []
+        async for doc in cursor:
+            logs.append(AuditLog(**doc))
+        return logs
 
 # Global MongoDB service instance
 mongodb_service = MongoDBService()
