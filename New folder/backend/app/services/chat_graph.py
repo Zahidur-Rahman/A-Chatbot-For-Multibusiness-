@@ -30,6 +30,7 @@ async def classify_message(context: ChatGraphState) -> ChatGraphState:
     return context
 
 async def router_node(context: ChatGraphState) -> ChatGraphState:
+    # Decide next node based on classification
     if context.is_db_query:
         context.next = "VectorSearch"
     else:
@@ -75,9 +76,10 @@ async def llm_chat_node(context: ChatGraphState) -> ChatGraphState:
     context.response = response
     return context
 
-async def db_tool_node(context: ChatGraphState) -> ChatGraphState:
+# --- New Node: Generate SQL Only (no execution) ---
+async def generate_sql_node(context: ChatGraphState) -> ChatGraphState:
     context.conversation_history = ensure_chat_messages(context.conversation_history or [])
-    # FINAL CHECK: Remove any trailing 'user' messages before building LLM input
+    # Remove any trailing 'user' messages before building LLM input
     while context.conversation_history and (
         getattr(context.conversation_history[-1], 'role', None) == 'user' or
         (isinstance(context.conversation_history[-1], dict) and context.conversation_history[-1].get('role') == 'user')
@@ -89,18 +91,14 @@ async def db_tool_node(context: ChatGraphState) -> ChatGraphState:
     messages = [
         {"role": "system", "content": context.sql_prompt},
     ] + [msg.model_dump() for msg in context.conversation_history]
-    # Always add the new user message as the last message
     messages.append({"role": "user", "content": context.message})
-    # ABSOLUTE GUARANTEE: If the last two messages are both 'user', remove the second-to-last one
     if len(messages) > 2 and messages[-1]["role"] == "user" and messages[-2]["role"] == "user":
         messages.pop(-2)
     logger.error(f"[LLM INPUT - BEFORE CALL] messages: {messages}")
-    # Assertion: no two consecutive messages have the same role
     for i in range(1, len(messages)):
         if messages[i]['role'] == messages[i-1]['role']:
             logger.error(f"[ASSERTION FAILED] Two consecutive roles: {messages[i-1]['role']} and {messages[i]['role']} at positions {i-1}, {i}: {messages}")
             raise ValueError(f"Two consecutive roles: {messages[i-1]['role']} and {messages[i]['role']} at positions {i-1}, {i}")
-    # Truncate to last valid system/user/assistant turn if error persists
     if len(messages) > 3:
         messages = [messages[0]] + messages[-2:]
         logger.error(f"[LLM INPUT - TRUNCATED] messages: {messages}")
@@ -108,35 +106,112 @@ async def db_tool_node(context: ChatGraphState) -> ChatGraphState:
     sql_query = clean_sql_from_llm(sql_response)
     logger.error(f"[DBTool] Generated SQL: {sql_query}")
     context.sql = sql_query
-    mcp_result = await mcp_client.execute_query(sql_query, context.business_id)
+    return context
+
+# --- New Node: Execute SQL via MCP ---
+async def execute_sql_node(context: ChatGraphState) -> ChatGraphState:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.error(f"[ExecuteSQL] About to execute SQL: {getattr(context, 'sql', None)} for business_id={getattr(context, 'business_id', None)}")
+    mcp_result = await mcp_client.execute_query(context.sql, context.business_id)
+    logger.error(f"[ExecuteSQL] MCP result: {mcp_result}")
     context.db_result = mcp_result
     context.response = format_db_result(mcp_result)
+    return context
+
+# --- Dependency Resolver logic after SQL generation (for delete confirmation) ---
+async def db_tool_with_dependency_check(context: ChatGraphState) -> ChatGraphState:
+    sql = context.sql or ""
+    # Check for DELETE and require confirmation BEFORE executing
+    if "delete" in sql.lower() and not getattr(context, "confirm_delete", False):
+        context.response = "You are about to delete data. Please confirm by replying 'confirm delete'."
+        context.pause_reason = "confirm_delete"
+        context.pause_message = context.response
+        context.next = "PauseNode"
+        return context
+    # Check for UPDATE and require confirmation BEFORE executing
+    if "update" in sql.lower() and not getattr(context, "confirm_update", False):
+        context.response = "You are about to update data. Please confirm by replying 'confirm update'."
+        context.pause_reason = "confirm_update"
+        context.pause_message = context.response
+        context.next = "PauseNode"
+        return context
+    # Only execute the SQL if not a DELETE/UPDATE or if already confirmed
+    context.next = "ExecuteSQL"
     return context
 
 async def response_node(context: ChatGraphState) -> ChatGraphState:
     return context
 
+async def pause_node(context: ChatGraphState) -> ChatGraphState:
+    # Set the correct pause message based on the reason
+    if getattr(context, "pause_reason", None) == "confirm_update":
+        context.response = "You are about to update data. Please confirm by replying 'confirm update'."
+        context.pause_message = context.response
+    elif getattr(context, "pause_reason", None) == "confirm_delete":
+        context.response = "You are about to delete data. Please confirm by replying 'confirm delete'."
+        context.pause_message = context.response
+    else:
+        # Fallback in case pause_reason is missing
+        context.response = "Confirmation required for this action. Please confirm to proceed."
+        context.pause_message = context.response
+    return context
+
+# --- New Node: Resume or Classify ---
+async def resume_or_classify_node(context: ChatGraphState) -> ChatGraphState:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.error(f"[ResumeOrClassify] resume_from_pause={getattr(context, 'resume_from_pause', False)}, next={getattr(context, 'next', None)}, sql={getattr(context, 'sql', None)}, pause_reason={getattr(context, 'pause_reason', None)}, message={getattr(context, 'message', None)}")
+    confirm_triggers = {"confirm", "yes", "confirm update", "confirm delete", "yes, update", "yes, delete", "update confirmed", "delete confirmed"}
+    user_message = getattr(context, 'message', '').strip().lower()
+    # If we are in a pause state and the user confirms, treat as confirmation
+    if not getattr(context, 'resume_from_pause', False) and getattr(context, 'pause_reason', None) and user_message in confirm_triggers:
+        logger.error(f"[ResumeOrClassify] Confirmation '{user_message}' received for pause_reason '{context.pause_reason}'. Resuming to ExecuteSQL.")
+        context.resume_from_pause = True
+        context.next = "ExecuteSQL"
+        return context
+    if getattr(context, "resume_from_pause", False):
+        context.next = "ExecuteSQL"
+    else:
+        context.next = "Classify"
+    return context
+
 # --- Build the LangGraph Workflow ---
 builder = StateGraph(ChatGraphState)
+builder.add_node("ResumeOrClassify", resume_or_classify_node)
 builder.add_node("Classify", classify_message)
 builder.add_node("Router", router_node)
 builder.add_node("VectorSearch", vector_search_node)
 builder.add_node("LLMChat", llm_chat_node)
-builder.add_node("DBTool", db_tool_node)
+builder.add_node("GenerateSQL", generate_sql_node)
+builder.add_node("DBToolWithDepCheck", db_tool_with_dependency_check)
+builder.add_node("ExecuteSQL", execute_sql_node)
 builder.add_node("Respond", response_node)
+builder.add_node("PauseNode", pause_node)
 
 # Edges
+builder.add_conditional_edges(
+    "ResumeOrClassify",
+    lambda x: x.next,
+    {"Classify": "Classify", "ExecuteSQL": "ExecuteSQL"}
+)
 builder.add_edge("Classify", "Router")
 builder.add_conditional_edges(
     "Router",
     lambda x: x.next,  # Use the 'next' attribute from router_node's return value
     {"LLMChat": "LLMChat", "VectorSearch": "VectorSearch"}
 )
-builder.add_edge("VectorSearch", "DBTool")
-builder.add_edge("DBTool", "Respond")
-builder.add_edge("LLMChat", "Respond")
+builder.add_edge("VectorSearch", "GenerateSQL")
+builder.add_edge("GenerateSQL", "DBToolWithDepCheck")
+builder.add_conditional_edges(
+    "DBToolWithDepCheck",
+    lambda x: getattr(x, "next", None),
+    {"PauseNode": "PauseNode", "ExecuteSQL": "ExecuteSQL"}
+)
+builder.add_edge("ExecuteSQL", "Respond")
+builder.add_edge("PauseNode", "Respond")
 
-builder.set_entry_point("Classify")
+builder.set_entry_point("ResumeOrClassify")
 
 chat_graph = builder.compile()
 

@@ -40,6 +40,8 @@ from backend.app.utils.query_classifier import is_database_related_query_dynamic
 from backend.app.models.conversation import ChatMessage, ConversationSessionCreate
 from backend.app.models.chat_graph_state import ChatGraphState
 from backend.app.utils.chat_helpers import format_db_result
+import copy
+from backend.app.models.conversation import ConversationMemory, Message
 
 # Helper to recursively extract DB-like responses for user-friendly formatting
 import re, json, ast
@@ -104,7 +106,7 @@ llm_service = MistralLLMService()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Multi-Business Conversational Chatbot...")
-
+    
     logger.info("Connecting to Redis...")
     settings = get_settings()
     redis_url = f"redis://{settings.redis.host}:{settings.redis.port}/0"
@@ -130,7 +132,7 @@ async def lifespan(app: FastAPI):
         logger.error(f"Startup failed: {e}", exc_info=True)
         # Don't raise the exception - let the app start even if indexing fails
         logger.warning("Continuing startup despite indexing errors")
-
+    
     logger.info("Application startup complete")
     yield  # Don't forget this!
 
@@ -858,25 +860,51 @@ async def chat_endpoint(
     current_user: dict = Depends(get_current_user),
     mongo_service: MongoDBService = Depends(get_mongodb_service)
 ):
-    # 1. Load or create session
-    if request.session_id:
-        session = await mongo_service.get_conversation_session(request.session_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail=f"Session with id {request.session_id} not found.")
-        if session and session.conversation_memory and session.conversation_memory.messages:
-            conversation_history = session.conversation_memory.messages
+    # 1. Load session from Redis first, then MongoDB if not found
+    session = None
+    conversation_history = []
+    pause_context = None
+    session_id = request.session_id
+    if session_id:
+        redis_data = await redis_service.get_session_conversation(session_id)
+        if redis_data:
+            # Build session and conversation_history from Redis data
+            conversation_memory = ConversationMemory(
+                messages=[Message(**msg) for msg in redis_data.get("messages", [])]
+            )
+            session = ConversationSession(
+                session_id=redis_data.get("session_id"),
+                user_id=redis_data.get("user_id", current_user["user_id"]),
+                business_id=redis_data.get("business_id", request.business_id or current_user["business_id"]),
+                conversation_memory=conversation_memory,
+                pause_context=redis_data.get("pause_context"),
+                created_at=redis_data.get("created_at"),
+                last_activity=redis_data.get("last_updated"),
+                expires_at=None,
+                status=redis_data.get("status", "active"),
+                cached_schema_context=redis_data.get("cached_schema_context"),
+                updated_at=None,
+                id=None
+            )
+            conversation_history = conversation_memory.messages
+            pause_context = redis_data.get("pause_context")
         else:
-            conversation_history = []
+            # Fallback to MongoDB
+            session = await mongo_service.get_conversation_session(session_id)
+            if session and session.conversation_memory and session.conversation_memory.messages:
+                conversation_history = session.conversation_memory.messages
+                pause_context = getattr(session, "pause_context", None)
+            else:
+                conversation_history = []
+                pause_context = None
     else:
         # New session
         conversation_history = []
         raw_user_id = str(current_user['user_id'])
         clean_user_id = raw_user_id.replace('"', '').replace("'", "")
-        logger.info(f"[SessionCreation] Raw user_id: '{raw_user_id}', Clean user_id: '{clean_user_id}'")
         session_id = f"sess_{clean_user_id}_{request.business_id or current_user['business_id']}_{int(datetime.now(timezone.utc).timestamp())}"
-        logger.info(f"[SessionCreation] Generated session_id: '{session_id}'")
         session_data = ConversationSessionCreate(
-            session_id=session_id,  # Pass session_id for Pydantic v2 compatibility
+            session_id=session_id,
             user_id=clean_user_id,
             business_id=request.business_id or current_user["business_id"],
             expires_at=datetime.now(timezone.utc) + timedelta(hours=24)
@@ -884,45 +912,112 @@ async def chat_endpoint(
         session = await mongo_service.create_conversation_session(session_data)
         session.session_id = session_id
         request.session_id = session_id
+        pause_context = None
 
-    # 2.5. Ensure all messages are valid ChatMessage before passing to graph
+    # Ensure all messages are valid ChatMessage before passing to agentic workflow
     conversation_history = ensure_chat_messages(conversation_history)
-
-    # 2.6. Limit to last 20 messages for context (regardless of role)
     conversation_history = conversation_history[-20:]
-    # Ensure the last message is not a 'user' message
     while conversation_history and conversation_history[-1].role == 'user':
         conversation_history.pop()
 
-    # 3. Build context for LangGraph
-    context = {
-        "message": request.message,
-        "business_id": request.business_id or current_user["business_id"],
-        "user_id": current_user["user_id"],
-        "conversation_history": conversation_history,
-    }
+    # --- PAUSE/RESUME LOGIC ---
+    confirm_triggers = {"confirm", "yes", "confirm update", "confirm delete", "yes, update", "yes, delete", "update confirmed", "delete confirmed"}
+    user_message = request.message.strip().lower()
+    pause_sql = None
+    pause_schema_context = None
+    pause_business_id = None
+    pause_reason = None
+    pause_message = None
+    if hasattr(session, 'pause_context') and session.pause_context:
+        pause_reason = session.pause_context.get('pause_reason')
+        pause_message = session.pause_context.get('pause_message')
+        if user_message in confirm_triggers and pause_reason:
+            logger.error(f"[ChatEndpoint] Confirmation '{user_message}' received for pause_reason '{pause_reason}'. Resuming to ExecuteSQL.")
+            state = ChatGraphState(
+                user_id=session.user_id,
+                business_id=pause_business_id or session.business_id,
+                message=request.message,
+                conversation_history=[ChatMessage(role=m.role, content=m.content) for m in session.conversation_memory.messages],
+                sql=pause_sql,
+                schema_context=pause_schema_context,
+                resume_from_pause=True,
+                next="ExecuteSQL",
+                pause_reason=pause_reason,
+                pause_message=pause_message,
+                confirm_delete=(pause_reason == "confirm_delete"),
+                confirm_update=(pause_reason == "confirm_update"),
+            )
+            session.pause_context = None
+        else:
+            state = ChatGraphState(
+                user_id=session.user_id,
+                business_id=session.business_id,
+                message=request.message,
+                conversation_history=[ChatMessage(role=m.role, content=m.content) for m in session.conversation_memory.messages],
+                pause_reason=pause_reason,
+                pause_message=pause_message,
+            )
+    else:
+        state = ChatGraphState(
+            user_id=session.user_id,
+            business_id=session.business_id,
+            message=request.message,
+            conversation_history=[ChatMessage(role=m.role, content=m.content) for m in session.conversation_memory.messages],
+        )
 
-    # 4. Run the LangGraph workflow
-    result = await chat_graph.ainvoke(context)
-
-    # 5. Extract plain text for assistant response (always a string)
+    # 4. Build LangGraph state and run the workflow
+    # Use 'state' for workflow execution
+    langgraph_state = copy.deepcopy(state)
+    result = await chat_graph.ainvoke(langgraph_state)
     assistant_response = str(result.get('response', '')).strip()
 
-    # 5.5. Post-process for user-friendliness if DB-like result
+    # 5. Handle delete/update confirmation pause (if present)
+    if result.get('pause_reason') in ['confirm_delete', 'confirm_update']:
+        assistant_response = result.get('pause_message', assistant_response)
+        pause_context = {
+            'sql': result.get('sql'),
+            'schema_context': result.get('schema_context'),
+            'business_id': state.business_id,
+            'user_id': state.user_id,
+            'conversation_history': [msg.model_dump() for msg in state.conversation_history],
+            'pause_reason': result.get('pause_reason'),
+            'pause_message': result.get('pause_message'),
+        }
+    else:
+        pause_context = None
+
+    # 6. Post-process for user-friendliness if DB-like result
     db_like = extract_db_like(assistant_response)
     if db_like:
         assistant_response = format_db_result(db_like)
 
-    # 6. Append new user and assistant messages AFTER the workflow
+    # 7. Append new user and assistant messages AFTER the workflow
     conversation_history.append(ChatMessage(role="user", content=request.message))
     conversation_history.append(ChatMessage(role="assistant", content=assistant_response))
     session.conversation_memory.messages = conversation_history
+    session.pause_context = pause_context
+
+    # 8. Save to MongoDB (for durability)
     await mongo_service.update_conversation_session(session)
 
-    # 7. Return a user-friendly response
+    # 9. Save to Redis (for speed)
+    await redis_service.cache_session_conversation(
+        session.session_id,
+        {
+            "session_id": session.session_id,
+            "user_id": session.user_id,
+            "business_id": session.business_id,
+            "messages": [msg.model_dump() for msg in conversation_history],
+            "pause_context": pause_context,
+            "created_at": str(session.created_at),
+            "last_updated": str(datetime.now(timezone.utc)),
+        }
+    )
+
+    # 10. Return response
     return ChatResponse(
         response=assistant_response,
-        session_id=request.session_id
+        session_id=session.session_id
     )
 
 @app.post("/debug/generate-sql")

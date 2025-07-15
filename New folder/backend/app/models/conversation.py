@@ -57,6 +57,7 @@ class ConversationSession(BaseModel):
     last_activity: datetime = Field(default_factory=datetime.utcnow)
     expires_at: Optional[datetime] = None
     cached_schema_context: Optional[List[dict]] = None  # Cached vector search result
+    pause_context: Optional[dict] = None  # For pause/resume support
     
     class Config:
         validate_by_name = True
@@ -143,5 +144,3 @@ class ConversationResponse(BaseModel):
     context: ConversationContext
     analytics: Optional[Dict[str, Any]] = None
 
-# This function was removed to avoid circular imports
-# Use the service directly where needed 

@@ -14,4 +14,8 @@ class ChatGraphState(BaseModel):
     sql: Optional[str] = None
     db_result: Optional[Any] = None
     response: Optional[str] = None
-    next: Optional[str] = None  # For routing in LangGraph 
+    next: Optional[str] = None  # For routing in LangGraph
+    # --- Add these fields for pause/resume support ---
+    pause_reason: Optional[str] = None
+    pause_message: Optional[str] = None
+    confirm_delete: Optional[bool] = None 
