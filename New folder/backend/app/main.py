@@ -42,6 +42,7 @@ from backend.app.models.chat_graph_state import ChatGraphState
 from backend.app.utils.chat_helpers import format_db_result
 import copy
 from backend.app.models.conversation import ConversationMemory, Message
+import bson
 
 # Helper to recursively extract DB-like responses for user-friendly formatting
 import re, json, ast
@@ -86,6 +87,17 @@ def extract_db_like(text):
                 return found
     return None
 
+def convert_objectid_to_str(obj):
+    if isinstance(obj, dict):
+        return {k: convert_objectid_to_str(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_objectid_to_str(i) for i in obj]
+    elif hasattr(obj, 'to_str'):
+        return str(obj)
+    elif 'ObjectId' in str(type(obj)):
+        return str(obj)
+    return obj
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -96,15 +108,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MCP_SERVER_PATH = os.path.join(os.path.dirname(__file__), "mcp", "server_enhanced.py")
-mcp_client = MCPClient(MCP_SERVER_PATH)
-
-# Global service instances
+mcp_client = None  # Global placeholder
 vector_search_service = FaissVectorSearchService()
 llm_service = MistralLLMService()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global mcp_client
     logger.info("Starting Multi-Business Conversational Chatbot...")
     
     logger.info("Connecting to Redis...")
@@ -133,8 +143,16 @@ async def lifespan(app: FastAPI):
         # Don't raise the exception - let the app start even if indexing fails
         logger.warning("Continuing startup despite indexing errors")
     
+    # Start MCP client here
+    MCP_SERVER_PATH = os.path.join(os.path.dirname(__file__), "mcp", "server_enhanced.py")
+    mcp_client = MCPClient(MCP_SERVER_PATH)
+    logger.info("MCP client started.")
     logger.info("Application startup complete")
     yield  # Don't forget this!
+    # Optionally: shutdown/cleanup MCP client here
+    if mcp_client:
+        await mcp_client.aclose()
+        logger.info("MCP client closed.")
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application"""
@@ -268,19 +286,13 @@ def clean_session_id(session_id: str) -> str:
     if not session_id:
         return session_id
     
-    logger.info(f"[CleanSessionID] Original session_id: '{session_id}'")
-    
     # Remove escaped quotes that Swagger UI might add
     cleaned = session_id.replace('\\"', '').replace('"', '')
     
-    logger.info(f"[CleanSessionID] After quote removal: '{cleaned}'")
-    
     # Ensure it starts with 'sess_'
     if not cleaned.startswith('sess_'):
-        logger.warning(f"[CleanSessionID] Session ID doesn't start with 'sess_': '{cleaned}'")
         return session_id  # Return original if it doesn't match expected format
     
-    logger.info(f"[CleanSessionID] Final cleaned session_id: '{cleaned}'")
     return cleaned
 
 def serialize_message_for_redis(msg) -> dict:
@@ -377,9 +389,7 @@ async def admin_add_business(
     mongo_service: MongoDBService = Depends(get_mongodb_service)
 ):
     logger.info(f"Adding business: {request.business_id}")
-    logger.info(f"Adding businessx: {request.business_id}")
     success = await mongo_service.add_business(request.business_id, request.config)
-    logger.info(f"Success: {success}")
     
     if not success:
         raise HTTPException(status_code=400, detail="Failed to add business")
@@ -826,9 +836,6 @@ class ChatResponse(BaseModel):
             str: lambda v: v.replace('\\"', '').replace('"', '') if isinstance(v, str) else v
         }
 
-llm_service = MistralLLMService()
-# mongo_service = mongodb_service # This line is no longer needed
-
 # Add this function to extract user_id from the request state (assuming authentication middleware sets it)
 async def get_user_id(request: Request):
     # If you use request.state.user, adjust as needed
@@ -931,32 +938,30 @@ async def chat_endpoint(
     if hasattr(session, 'pause_context') and session.pause_context:
         pause_reason = session.pause_context.get('pause_reason')
         pause_message = session.pause_context.get('pause_message')
-        if user_message in confirm_triggers and pause_reason:
-            logger.error(f"[ChatEndpoint] Confirmation '{user_message}' received for pause_reason '{pause_reason}'. Resuming to ExecuteSQL.")
-            state = ChatGraphState(
-                user_id=session.user_id,
-                business_id=pause_business_id or session.business_id,
-                message=request.message,
-                conversation_history=[ChatMessage(role=m.role, content=m.content) for m in session.conversation_memory.messages],
-                sql=pause_sql,
-                schema_context=pause_schema_context,
-                resume_from_pause=True,
-                next="ExecuteSQL",
-                pause_reason=pause_reason,
-                pause_message=pause_message,
-                confirm_delete=(pause_reason == "confirm_delete"),
-                confirm_update=(pause_reason == "confirm_update"),
-            )
-            session.pause_context = None
-        else:
-            state = ChatGraphState(
-                user_id=session.user_id,
-                business_id=session.business_id,
-                message=request.message,
-                conversation_history=[ChatMessage(role=m.role, content=m.content) for m in session.conversation_memory.messages],
-                pause_reason=pause_reason,
-                pause_message=pause_message,
-            )
+        pause_sql = session.pause_context.get('sql')
+        pause_schema_context = session.pause_context.get('schema_context')
+        pause_business_id = session.pause_context.get('business_id')
+        cleaned_history = [ChatMessage(role=m.role, content=m.content) for m in session.conversation_memory.messages]
+        # Remove trailing (user: yes, assistant: confirm prompt) pairs
+        while len(cleaned_history) >= 2 and \
+            cleaned_history[-1].role == 'assistant' and 'confirm' in cleaned_history[-1].content.lower() and \
+            cleaned_history[-2].role == 'user' and any(trigger in cleaned_history[-2].content.lower() for trigger in confirm_triggers):
+            cleaned_history = cleaned_history[:-2]
+        import string
+        user_message_clean = request.message.strip().lower().translate(str.maketrans('', '', string.punctuation))
+        is_confirmation = any(trigger in user_message_clean for trigger in confirm_triggers)
+        state = ChatGraphState(
+            user_id=session.user_id,
+            business_id=pause_business_id or session.business_id,
+            message=request.message,
+            conversation_history=cleaned_history,
+            sql=pause_sql,
+            schema_context=pause_schema_context,
+            resume_from_pause=is_confirmation,
+            pause_reason=pause_reason,
+            pause_message=pause_message,
+            confirm=is_confirmation,
+        )
     else:
         state = ChatGraphState(
             user_id=session.user_id,
@@ -967,6 +972,9 @@ async def chat_endpoint(
 
     # 4. Build LangGraph state and run the workflow
     # Use 'state' for workflow execution
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"DEBUG: Initial workflow state: pause_reason={getattr(state, 'pause_reason', None)}, resume_from_pause={getattr(state, 'resume_from_pause', None)}, confirm={getattr(state, 'confirm', None)}, message='{state.message}'")
     langgraph_state = copy.deepcopy(state)
     result = await chat_graph.ainvoke(langgraph_state)
     assistant_response = str(result.get('response', '')).strip()
@@ -985,6 +993,8 @@ async def chat_endpoint(
         }
     else:
         pause_context = None
+        # Ensure pause_context is cleared after confirmation
+        session.pause_context = None
 
     # 6. Post-process for user-friendliness if DB-like result
     db_like = extract_db_like(assistant_response)
@@ -994,24 +1004,49 @@ async def chat_endpoint(
     # 7. Append new user and assistant messages AFTER the workflow
     conversation_history.append(ChatMessage(role="user", content=request.message))
     conversation_history.append(ChatMessage(role="assistant", content=assistant_response))
-    session.conversation_memory.messages = conversation_history
+    # Remove trailing confirmation/yes pairs before saving
+    cleaned_history = conversation_history
+    while len(cleaned_history) >= 2 and \
+        cleaned_history[-1].role == 'assistant' and 'confirm' in cleaned_history[-1].content.lower() and \
+        cleaned_history[-2].role == 'user' and any(trigger in cleaned_history[-2].content.lower() for trigger in confirm_triggers):
+        cleaned_history = cleaned_history[:-2]
+    session.conversation_memory.messages = cleaned_history
     session.pause_context = pause_context
+
+    # After workflow execution and before saving session:
+    if state.confirm and state.resume_from_pause:
+        # Remove the last two messages (confirmation prompt and user "yes")
+        if len(state.conversation_history) >= 2:
+            state.conversation_history = state.conversation_history[:-2]
+        # Optionally, add a result message from the assistant
+        if state.response:
+            state.conversation_history.append({'role': 'assistant', 'content': state.response})
+        # Clear pause context ONLY after confirmation and update execution
+        session.pause_context = None
+        pause_context = None  # Also clear for Redis
 
     # 8. Save to MongoDB (for durability)
     await mongo_service.update_conversation_session(session)
 
     # 9. Save to Redis (for speed)
+    # Guarantee pause_context is not present after confirmation
+    if state.confirm and state.resume_from_pause:
+        pause_context = None
+        session.pause_context = None
+    logger.debug(f"[ChatEndpoint] Saving to Redis. pause_context: {pause_context}")
+    redis_data = {
+        "session_id": session.session_id,
+        "user_id": session.user_id,
+        "business_id": session.business_id,
+        "messages": [msg.model_dump() for msg in conversation_history],
+        "pause_context": pause_context,  # This will be None if cleared
+        "created_at": str(session.created_at),
+        "last_updated": str(datetime.now(timezone.utc)),
+    }
+    redis_data = convert_objectid_to_str(redis_data)
     await redis_service.cache_session_conversation(
         session.session_id,
-        {
-            "session_id": session.session_id,
-            "user_id": session.user_id,
-            "business_id": session.business_id,
-            "messages": [msg.model_dump() for msg in conversation_history],
-            "pause_context": pause_context,
-            "created_at": str(session.created_at),
-            "last_updated": str(datetime.now(timezone.utc)),
-        }
+        redis_data
     )
 
     # 10. Return response

@@ -28,7 +28,6 @@ class MistralLLMService:
         messages: List of dicts with 'role' ('user' or 'system') and 'content'.
         Returns: LLM response as string.
         """
-        logger.error(f"[MISTRAL LLM CHAT INPUT] messages: {messages}")
         lc_messages = []
         for msg in messages:
             if msg['role'] == 'user':

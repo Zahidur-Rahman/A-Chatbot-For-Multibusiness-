@@ -29,7 +29,6 @@ class MongoDBService:
     
     async def connect(self):
         """Connect to MongoDB"""
-        logger.info("MongoDBService.connect() called")
         try:
             self.client = AsyncIOMotorClient(self.settings.mongodb.uri)
             self.db = self.client[self.settings.mongodb.database]
@@ -48,8 +47,6 @@ class MongoDBService:
             
             # Create indexes
             await self._create_indexes()
-            
-            logger.info("Connected to MongoDB successfully")
             
         except Exception as e:
             logger.error(f"Failed to connect to MongoDB: {e}")
@@ -105,8 +102,6 @@ class MongoDBService:
             await self._collections['audit_logs'].create_index([("table_name", ASCENDING)])
             await self._collections['audit_logs'].create_index([("timestamp", DESCENDING)])
             
-            logger.info("Database indexes created successfully")
-            
         except Exception as e:
             logger.error(f"Failed to create indexes: {e}")
             raise
@@ -121,7 +116,6 @@ class MongoDBService:
             config = BusinessConfig(**business_config.dict())
             result = await self._collections['business_configs'].insert_one(config.dict(by_alias=True))
             config.id = result.inserted_id
-            logger.info(f"Created business config for: {business_config.business_id}")
             return config
         except DuplicateKeyError:
             raise ValueError(f"Business '{business_config.business_id}' already exists")
@@ -165,7 +159,6 @@ class MongoDBService:
         try:
             result = await self._collections['business_schemas'].insert_one(schema.dict(by_alias=True))
             schema.id = result.inserted_id
-            logger.info(f"Created schema for business: {schema.business_id}, table: {schema.table_name}")
             return schema
         except DuplicateKeyError:
             raise ValueError(f"Schema for table '{schema.table_name}' in business '{schema.business_id}' already exists")
@@ -230,7 +223,6 @@ class MongoDBService:
             )
             result = await self._collections['users'].insert_one(user.dict(by_alias=True))
             user.id = result.inserted_id
-            logger.info(f"Created user: {user_data.username}")
             return user
         except DuplicateKeyError:
             raise ValueError(f"User '{user_data.username}' already exists")
@@ -323,7 +315,6 @@ class MongoDBService:
             )
             result = await self._collections['conversation_sessions'].insert_one(session.dict(by_alias=True))
             session.id = result.inserted_id
-            logger.info(f"Created conversation session: {session.session_id}")
             return session
         except DuplicateKeyError:
             raise ValueError(f"Conversation session already exists")
@@ -333,8 +324,6 @@ class MongoDBService:
         try:
             # Clean the session_id before creating the session
             cleaned_session_id = session_id.replace('"', '').replace('\\"', '')
-            logger.info(f"[MongoDB] Creating session with cleaned ID: '{cleaned_session_id}' (original: '{session_id}')")
-            
             session = ConversationSession(
                 session_id=cleaned_session_id,
                 user_id=user_id,
@@ -343,7 +332,6 @@ class MongoDBService:
             )
             result = await self._collections['conversation_sessions'].insert_one(session.dict(by_alias=True))
             session.id = result.inserted_id
-            logger.info(f"Created conversation session with specific ID: {session.session_id}")
             return session
         except DuplicateKeyError:
             raise ValueError(f"Conversation session with ID '{session_id}' already exists")
@@ -358,18 +346,15 @@ class MongoDBService:
             )
             
             if result.modified_count > 0:
-                logger.info(f"[MongoDB] Migrated session from '{old_session_id}' to '{new_session_id}'")
                 return True
             else:
-                logger.warning(f"[MongoDB] No session found to migrate: '{old_session_id}'")
                 return False
         except Exception as e:
-            logger.error(f"[MongoDB] Error migrating session: {e}")
+            logger.error(f"Error migrating session: {e}")
             return False
     
     async def get_conversation_session(self, session_id: str) -> Optional[ConversationSession]:
         """Get conversation session by session_id"""
-        logger.info(f"[MongoDB] Looking for session: '{session_id}'")
         
         # Try the exact session_id first
         doc = await self._collections['conversation_sessions'].find_one({"session_id": session_id})
@@ -377,56 +362,39 @@ class MongoDBService:
         if not doc:
             # Try with escaped quotes (common in Swagger UI)
             escaped_session_id = f'"{session_id}"'
-            logger.info(f"[MongoDB] Trying escaped session_id: '{escaped_session_id}'")
             doc = await self._collections['conversation_sessions'].find_one({"session_id": escaped_session_id})
         
         if not doc:
             # Try with double escaped quotes
             double_escaped_session_id = f'\\"{session_id}\\"'
-            logger.info(f"[MongoDB] Trying double escaped session_id: '{double_escaped_session_id}'")
             doc = await self._collections['conversation_sessions'].find_one({"session_id": double_escaped_session_id})
         
         if not doc:
             # Try removing quotes from the session_id
             clean_session_id = session_id.replace('"', '').replace('\\"', '')
             if clean_session_id != session_id:
-                logger.info(f"[MongoDB] Trying clean session_id: '{clean_session_id}'")
                 doc = await self._collections['conversation_sessions'].find_one({"session_id": clean_session_id})
-        
-        if doc:
-            logger.info(f"[MongoDB] Found session with {len(doc.get('conversation_memory', {}).get('messages', []))} messages")
-        else:
-            logger.info(f"[MongoDB] Session not found after trying all formats")
         
         return ConversationSession(**doc) if doc else None
     
     async def update_conversation_session(self, session: ConversationSession) -> bool:
         """Update an existing conversation session by session_id."""
-        logger.info(f"[MongoDB] Updating session: {session.session_id}")
-        logger.info(f"[MongoDB] Session has {len(session.conversation_memory.messages) if session.conversation_memory else 0} messages")
         
         # Always include conversation_memory in updates, even if it's empty
         update_data = session.dict(exclude={"session_id"})
         update_data["updated_at"] = datetime.now(timezone.utc)
-        
-        logger.info(f"[MongoDB] Update data keys: {list(update_data.keys())}")
-        if 'conversation_memory' in update_data:
-            logger.info(f"[MongoDB] Conversation memory has {len(update_data['conversation_memory'].get('messages', []))} messages")
         
         result = await self._collections['conversation_sessions'].update_one(
             {"session_id": session.session_id},
             {"$set": update_data}
         )
         
-        logger.info(f"[MongoDB] Update result: modified_count={result.modified_count}, matched_count={result.matched_count}")
         return result.modified_count > 0
     
     async def update_conversation_memory(self, session_id: str, memory_data: Dict[str, Any]) -> bool:
         """Update conversation memory"""
         # Clean the session_id before using it
         cleaned_session_id = session_id.replace('"', '').replace('\\"', '')
-        logger.info(f"[MongoDB] Updating conversation memory for session: {cleaned_session_id} (original: {session_id})")
-        logger.info(f"[MongoDB] Memory data has {len(memory_data.get('messages', []))} messages")
         
         result = await self._collections['conversation_sessions'].update_one(
             {"session_id": cleaned_session_id},
@@ -438,15 +406,12 @@ class MongoDBService:
             }
         )
         
-        logger.info(f"[MongoDB] Memory update result: modified_count={result.modified_count}, matched_count={result.matched_count}")
         return result.modified_count > 0
     
     async def update_conversation_memory_upsert(self, session_id: str, memory_data: Dict[str, Any], user_id: str, business_id: str) -> bool:
         """Update conversation memory with upsert functionality"""
         # Clean the session_id before using it
         cleaned_session_id = session_id.replace('"', '').replace('\\"', '')
-        logger.info(f"[MongoDB] Updating conversation memory with upsert for session: {cleaned_session_id} (original: {session_id})")
-        logger.info(f"[MongoDB] Memory data has {len(memory_data.get('messages', []))} messages")
         
         result = await self._collections['conversation_sessions'].update_one(
             {"session_id": cleaned_session_id},
@@ -464,7 +429,6 @@ class MongoDBService:
             upsert=True
         )
         
-        logger.info(f"[MongoDB] Memory upsert result: modified_count={result.modified_count}, matched_count={result.matched_count}, upserted_id={result.upserted_id}")
         return result.modified_count > 0 or result.upserted_id is not None
     
     async def get_user_conversations(self, user_id: str, business_id: str, limit: int = 10) -> List[ConversationSession]:
@@ -574,7 +538,6 @@ class MongoDBService:
         try:
             result = await self._collections['audit_logs'].insert_one(audit_log.dict(by_alias=True))
             audit_log.id = result.inserted_id
-            logger.info(f"Created audit log for user {audit_log.user_id}, operation: {audit_log.operation_type}")
             return audit_log
         except Exception as e:
             logger.error(f"Failed to create audit log: {e}")

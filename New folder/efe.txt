@@ -1,0 +1,57 @@
+# =========================
+# Core Server Settings
+# =========================
+DEBUG=True
+LOG_LEVEL=INFO
+
+# =========================
+# JWT Settings
+# =========================
+JWT_SECRET_KEY=7801234560ZahiD23456789@#$%^&*()ZAHID
+JWT_ALGORITHM=HS256
+JWT_EXPIRATION=7200
+JWT_REFRESH_EXPIRATION=86400
+
+# =========================
+# MongoDB
+# =========================
+MONGODB_URI=mongodb://admin:123456@localhost:27017
+MONGODB_DB=chatbot_config
+
+# =========================
+# Redis
+# =========================
+REDIS_HOST=localhost
+REDIS_PORT=6379
+
+# =========================
+# Mistral LLM
+# =========================
+MISTRAL_API_KEY=1Q7TJnZNAJMSJ3XBEBkTYfcpy9BeEFDg
+MISTRAL_MODEL=mistral-large-2407
+
+# =========================
+# Vector Search
+# =========================
+VECTOR_STORE_TYPE=faiss
+FAISS_INDEX_PATH=./faiss_index.idx
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+
+# =========================
+# Multi-Business Config
+# =========================
+
+# =========================
+# CORS (optional)
+# =========================
+#ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
+
+# =========================
+# Feature Flags (optional)
+# =========================
+ENABLE_VECTOR_SEARCH=True
+ENABLE_SCHEMA_DISCOVERY=True
+ENABLE_CONVERSATION_MEMORY=True
+ENABLE_MULTI_BUSINESS=True
+ENABLE_ANALYTICS=True
+MAX_CONVERSATION_CONTEXT_MESSAGES=20 
