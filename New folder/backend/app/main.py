@@ -867,6 +867,8 @@ async def chat_endpoint(
     current_user: dict = Depends(get_current_user),
     mongo_service: MongoDBService = Depends(get_mongodb_service)
 ):
+    import logging
+    logger = logging.getLogger(__name__)
     # 1. Load session from Redis first, then MongoDB if not found
     session = None
     conversation_history = []
@@ -921,6 +923,9 @@ async def chat_endpoint(
         request.session_id = session_id
         pause_context = None
 
+    # After loading session
+    logger.info(f"DEBUG: After loading session, pause_context={getattr(session, 'pause_context', None)}")
+
     # Ensure all messages are valid ChatMessage before passing to agentic workflow
     conversation_history = ensure_chat_messages(conversation_history)
     conversation_history = conversation_history[-20:]
@@ -929,6 +934,7 @@ async def chat_endpoint(
 
     # --- PAUSE/RESUME LOGIC ---
     confirm_triggers = {"confirm", "yes", "confirm update", "confirm delete", "yes, update", "yes, delete", "update confirmed", "delete confirmed"}
+    cancel_triggers = {"no", "cancel", "stop", "abort", "never mind", "nevermind"}
     user_message = request.message.strip().lower()
     pause_sql = None
     pause_schema_context = None
@@ -950,6 +956,7 @@ async def chat_endpoint(
         import string
         user_message_clean = request.message.strip().lower().translate(str.maketrans('', '', string.punctuation))
         is_confirmation = any(trigger in user_message_clean for trigger in confirm_triggers)
+        is_cancel = any(trigger in user_message_clean for trigger in cancel_triggers)
         state = ChatGraphState(
             user_id=session.user_id,
             business_id=pause_business_id or session.business_id,
@@ -972,15 +979,88 @@ async def chat_endpoint(
 
     # 4. Build LangGraph state and run the workflow
     # Use 'state' for workflow execution
-    import logging
-    logger = logging.getLogger(__name__)
-    logger.info(f"DEBUG: Initial workflow state: pause_reason={getattr(state, 'pause_reason', None)}, resume_from_pause={getattr(state, 'resume_from_pause', None)}, confirm={getattr(state, 'confirm', None)}, message='{state.message}'")
+    # After loading session and before invoking the workflow
+    if hasattr(session, 'pause_context') and session.pause_context:
+        pause_reason = session.pause_context.get('pause_reason')
+        pause_message = session.pause_context.get('pause_message')
+        pause_sql = session.pause_context.get('sql')
+        pause_schema_context = session.pause_context.get('schema_context')
+        pause_business_id = session.pause_context.get('business_id')
+        user_message = request.message.strip().lower()
+        import string
+        user_message_clean = user_message.translate(str.maketrans('', '', string.punctuation))
+        confirm_triggers = {"confirm", "yes", "confirm update", "confirm delete", "yes update", "yes delete", "update confirmed", "delete confirmed"}
+        is_confirmation = any(trigger in user_message_clean for trigger in confirm_triggers)
+        is_cancel = any(trigger in user_message_clean for trigger in cancel_triggers)
+        logger.info(f"DEBUG: pause_context present. pause_reason={pause_reason}, user_message='{user_message}', user_message_clean='{user_message_clean}', is_confirmation={is_confirmation}, is_cancel={is_cancel}")
+        if is_cancel:
+            # Clear pause context and respond with cancellation
+            session.pause_context = None
+            pause_context = None
+            assistant_response = "Okay, the operation has been cancelled. Let me know if you need anything else!"
+            await mongo_service.update_conversation_session(session)
+            redis_data = {
+                "session_id": session.session_id,
+                "user_id": session.user_id,
+                "business_id": session.business_id,
+                "messages": [msg.model_dump() for msg in conversation_history],
+                "pause_context": pause_context,
+                "created_at": str(session.created_at),
+                "last_updated": str(datetime.now(timezone.utc)),
+            }
+            redis_data = convert_objectid_to_str(redis_data)
+            await redis_service.cache_session_conversation(session.session_id, redis_data)
+            return ChatResponse(
+                response=assistant_response,
+                session_id=session.session_id
+            )
+        if is_confirmation:
+            state = ChatGraphState(
+                message=request.message,
+                business_id=pause_business_id or session.business_id,
+                user_id=session.user_id,
+                conversation_history=conversation_history,
+                pause_reason=pause_reason,
+                pause_message=pause_message,
+                sql=pause_sql,
+                schema_context=pause_schema_context,
+                resume_from_pause=True,
+                confirm=True,
+            )
+            logger.info(f"DEBUG: Constructed state for confirmation: pause_reason={pause_reason}, resume_from_pause=True, confirm=True, message='{request.message}'")
+        else:
+            state = ChatGraphState(
+                message=request.message,
+                business_id=pause_business_id or session.business_id,
+                user_id=session.user_id,
+                conversation_history=conversation_history,
+                pause_reason=pause_reason,
+                pause_message=pause_message,
+                sql=pause_sql,
+                schema_context=pause_schema_context,
+                resume_from_pause=False,
+                confirm=False,
+            )
+            logger.info(f"DEBUG: Constructed state for waiting confirmation: pause_reason={pause_reason}, resume_from_pause=False, confirm=False, message='{request.message}'")
+    else:
+        # Normal state construction
+        state = ChatGraphState(
+            message=request.message,
+            business_id=session.business_id,
+            user_id=session.user_id,
+            conversation_history=conversation_history,
+        )
+        logger.info(f"DEBUG: Constructed normal state: message='{request.message}', business_id={session.business_id}, user_id={session.user_id}")
+    # Log the state before workflow invocation
+    logger.info(f"DEBUG: Passing state to workflow: pause_reason={getattr(state, 'pause_reason', None)}, resume_from_pause={getattr(state, 'resume_from_pause', None)}, confirm={getattr(state, 'confirm', None)}, message='{state.message}'")
     langgraph_state = copy.deepcopy(state)
     result = await chat_graph.ainvoke(langgraph_state)
-    assistant_response = str(result.get('response', '')).strip()
+    logger.info(f"DEBUG: Workflow returned result of type {type(result)}: {result}")
+    assistant_response = str(result.get('response', '')).strip() if isinstance(result, dict) else str(getattr(result, 'response', ''))
 
     # 5. Handle delete/update confirmation pause (if present)
-    if result.get('pause_reason') in ['confirm_delete', 'confirm_update']:
+    if isinstance(result, dict) and result.get('pause_reason') in ['confirm_delete', 'confirm_update']:
+        logger.info(f"DEBUG: Workflow result for pause: {result}")
         assistant_response = result.get('pause_message', assistant_response)
         pause_context = {
             'sql': result.get('sql'),
@@ -991,10 +1071,9 @@ async def chat_endpoint(
             'pause_reason': result.get('pause_reason'),
             'pause_message': result.get('pause_message'),
         }
-    else:
-        pause_context = None
-        # Ensure pause_context is cleared after confirmation
-        session.pause_context = None
+        session.pause_context = pause_context  # <-- SAVE THE ACTUAL CONTEXT!
+        logger.info(f"DEBUG: Saving session.pause_context={pause_context}")
+    # Only clear pause_context after confirmed update/delete execution, not here!
 
     # 6. Post-process for user-friendliness if DB-like result
     db_like = extract_db_like(assistant_response)
@@ -1012,6 +1091,7 @@ async def chat_endpoint(
         cleaned_history = cleaned_history[:-2]
     session.conversation_memory.messages = cleaned_history
     session.pause_context = pause_context
+    logger.info(f"DEBUG: Saving session.pause_context={session.pause_context}")
 
     # After workflow execution and before saving session:
     if state.confirm and state.resume_from_pause:
@@ -1024,6 +1104,7 @@ async def chat_endpoint(
         # Clear pause context ONLY after confirmation and update execution
         session.pause_context = None
         pause_context = None  # Also clear for Redis
+        logger.info(f"DEBUG: Cleared pause_context after confirmed update/delete execution.")
 
     # 8. Save to MongoDB (for durability)
     await mongo_service.update_conversation_session(session)

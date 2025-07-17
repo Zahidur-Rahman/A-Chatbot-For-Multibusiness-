@@ -9,6 +9,7 @@ from backend.app.models.chat_graph_state import ChatGraphState
 import logging
 import time
 import string
+import json
 logger = logging.getLogger(__name__)
 
 # Instantiate your services (adjust script_path as needed)
@@ -115,30 +116,89 @@ async def execute_sql_node(context: ChatGraphState) -> ChatGraphState:
     start_time = time.time()
     try:
         mcp_result = await mcp_client.execute_query(sql, business_id)
+        logger.info(f"DEBUG: Executing SQL: {sql}")
+        logger.info(f"DEBUG: Raw DB result: {mcp_result}")
+        # --- FIX: Parse MCP result if it's a JSON string in content[0]['text'] ---
+        rows = []
+        if (
+            isinstance(mcp_result, dict)
+            and 'content' in mcp_result
+            and isinstance(mcp_result['content'], list)
+            and len(mcp_result['content']) > 0
+            and 'text' in mcp_result['content'][0]
+        ):
+            try:
+                parsed = json.loads(mcp_result['content'][0]['text'])
+                rows = parsed.get('results', [])
+                logger.info(f"DEBUG: Parsed rows from MCP result: {rows}")
+            except Exception as e:
+                logger.error(f"Error parsing MCP result: {e}")
+                rows = []
+        elif isinstance(mcp_result, list):
+            rows = mcp_result
         elapsed = time.time() - start_time
         if isinstance(mcp_result, dict) and mcp_result.get('error'):
-            logger.error(f"[SQL_EXECUTION] MCP ERROR for business_id={business_id}: {mcp_result.get('error')}")
+            logger.error(f"[SQL_EXECUTION] MCP ERROR for business_id={business_id}: {mcp_result['error']}")
+            context.response = (
+                "Sorry, I couldn't complete your request due to a database error: "
+                f"{mcp_result['error']}\n"
+                "Please resolve any related data (e.g., feedback linked to this customer) before deleting."
+            )
+            # Clear pause/confirmation fields to break the loop
+            context.pause_reason = None
+            context.pause_message = None
+            context.confirm = None
+            context.resume_from_pause = None
+            return context
+        # Determine query type
+        is_select = sql.strip().lower().startswith("select")
+        is_update = sql.strip().lower().startswith("update")
+        is_delete = sql.strip().lower().startswith("delete")
+        if is_select:
+            if not rows:
+                context.response = (
+                    "I couldn't find any matching records for your request. "
+                    "Would you like to try a different name or provide more details?"
+                )
+            else:
+                # Format the results for the user
+                result_strings = []
+                for row in rows:
+                    result_strings.append(
+                        ", ".join(f"{k}: {v}" for k, v in row.items())
+                    )
+                context.response = "Result: " + "; ".join(result_strings)
+        elif is_update:
+            context.response = (
+                "I've updated the information as you requested! "
+                "Is there anything else you'd like to change or check?"
+            )
+            # Clear pause/confirmation fields after success
+            context.pause_reason = None
+            context.pause_message = None
+            context.confirm = None
+            context.resume_from_pause = None
+        elif is_delete:
+            context.response = (
+                "The record has been deleted. Let me know if you need help with anything else!"
+            )
+            # Clear pause/confirmation fields after success
+            context.pause_reason = None
+            context.pause_message = None
+            context.confirm = None
+            context.resume_from_pause = None
         else:
-            logger.info(f"[SQL_EXECUTION] MCP response for business_id={business_id} (elapsed={elapsed:.2f}s): {mcp_result}")
-        context.db_result = mcp_result
-        context.response = format_db_result(mcp_result)
-        # --- FIX: Clear pause/confirmation fields after successful execution ---
-        context.pause_reason = None
-        context.pause_message = None
-        context.confirm = None
-        context.resume_from_pause = None
+            context.response = "The operation was completed."
     except Exception as e:
-        elapsed = time.time() - start_time
-        logger.error(f"[SQL_EXECUTION] Exception calling MCP for business_id={business_id}, sql={sql} (elapsed={elapsed:.2f}s): {e}", exc_info=True)
-        context.db_result = None
-        context.response = f"Error executing query: {e}"
+        logger.error(f"[SQL_EXECUTION] Exception: {e}")
+        context.response = f"Sorry, there was an error executing your request: {e}"
     return context
 
 # --- Dependency Resolver logic after SQL generation (for delete confirmation) ---
-async def db_tool_with_dependency_check(context: ChatGraphState) -> ChatGraphState:
-    sql = context.sql or ""
+async def db_tool_with_dependency_check(context: ChatGraphState) -> dict:
     import logging
     logger = logging.getLogger(__name__)
+    sql = context.sql or ""
     # Check for DELETE and require confirmation BEFORE executing
     if "delete" in sql.lower() and not getattr(context, "confirm", False):
         logger.error("[DBToolWithDepCheck] Pausing for delete confirmation")
@@ -146,27 +206,48 @@ async def db_tool_with_dependency_check(context: ChatGraphState) -> ChatGraphSta
         context.pause_reason = "confirm_delete"
         context.pause_message = context.response
         context.next = "PauseNode"
-        return context
+        return context.model_dump() # Return a dict for easy logging
     # Check for UPDATE and require confirmation BEFORE executing
     if "update" in sql.lower() and not getattr(context, "confirm", False):
         logger.error("[DBToolWithDepCheck] Pausing for update confirmation")
-        context.response = "You are about to update data. Please confirm by replying 'confirm update'."
-        context.pause_reason = "confirm_update"
-        context.pause_message = context.response
-        context.next = "PauseNode"
-        return context
+        pause_result = {
+            "pause_reason": "confirm_update",
+            "pause_message": "You are about to update data. Please confirm by replying 'confirm update'.",
+            "sql": sql,
+            "schema_context": getattr(context, 'schema_context', None),
+            "next": "PauseNode" # Ensure next is set for the main graph
+        }
+        logger.info(f"DEBUG: DBToolWithDepCheck returning pause_result: {pause_result}")
+        return pause_result
     # Only execute the SQL if not a DELETE/UPDATE or if already confirmed
     logger.error("[DBToolWithDepCheck] No confirmation needed, proceeding to ExecuteSQL")
     context.next = "ExecuteSQL"
-    return context
+    return context.model_dump() # Return a dict for easy logging
 
-async def response_node(context: ChatGraphState) -> ChatGraphState:
-    # --- FIX: Safety net to clear any lingering pause/confirmation fields ---
-    context.pause_reason = None
-    context.pause_message = None
-    context.confirm = None
-    context.resume_from_pause = None
-    return context
+async def response_node(context: ChatGraphState) -> dict:
+    import logging
+    logger = logging.getLogger(__name__)
+    output = {
+        'message': getattr(context, 'message', None),
+        'business_id': getattr(context, 'business_id', None),
+        'user_id': getattr(context, 'user_id', None),
+        'conversation_history': getattr(context, 'conversation_history', None),
+        'schema_context': getattr(context, 'schema_context', None),
+        'is_db_query': getattr(context, 'is_db_query', None),
+        'sql_prompt': getattr(context, 'sql_prompt', None),
+        'system_prompt': getattr(context, 'system_prompt', None),
+        'sql': getattr(context, 'sql', None),
+        'db_result': getattr(context, 'db_result', None),
+        'response': getattr(context, 'response', None),
+        'next': getattr(context, 'next', None),
+        # --- PAUSE FIELDS ---
+        'pause_reason': getattr(context, 'pause_reason', None),
+        'pause_message': getattr(context, 'pause_message', None),
+        'confirm': getattr(context, 'confirm', None),
+        'resume_from_pause': getattr(context, 'resume_from_pause', None),
+    }
+    logger.info(f"DEBUG: response_node output: {output}")
+    return output
 
 async def pause_node(context: ChatGraphState) -> ChatGraphState:
     # Set the correct pause message based on the reason

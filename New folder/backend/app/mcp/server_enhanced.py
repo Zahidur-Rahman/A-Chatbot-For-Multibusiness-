@@ -147,7 +147,8 @@ class ConnectionPoolManager:
                 self._health_check(business_id)
             except Exception as e:
                 logger.error(f"Health check failed for business {business_id}: {e}")
-            self.last_health_check[business_id] = current_time
+                self.last_health_check[business_id] = current_time
+                self.last_health_check[business_id] = current_time
         
         pool = self.get_pool(business_id)
         try:
@@ -186,10 +187,12 @@ class ConnectionPoolManager:
         """Perform health check on a business connection"""
         conn = None
         try:
-            conn = self.get_connection(business_id) # This call will already handle getting a fresh conn if needed
+            # FIX: Get connection directly from pool to avoid recursion
+            pool = self.get_pool(business_id)
+            conn = pool.getconn()
             if self.last_health_status[business_id] != "pass":
-                logger.info(f"Health check passed for business: {business_id}")
-            self.last_health_status[business_id] = "pass"
+                    logger.info(f"Health check passed for business: {business_id}")
+                    self.last_health_status[business_id] = "pass"
         except Exception as e:
             if self.last_health_status[business_id] != "fail":
                 logger.error(f"Health check failed for business {business_id}: {e}")
@@ -219,7 +222,7 @@ class ConnectionPoolManager:
                 # If recreation fails, remove it from pools to indicate it's truly down
                 if business_id in self.pools:
                     del self.pools[business_id]
-                
+    
     def close_all_pools(self):
         """Close all connection pools"""
         with self.lock:
@@ -716,16 +719,16 @@ async def main():
         
         # Run the MCP server with stdio transport
         async with stdio_server() as (read_stream, write_stream):
-            logger.info("Starting Multi-Business PostgreSQL MCP server...")
-            await postgres_server.server.run(
-                read_stream,
-                write_stream,
-                InitializationOptions(
-                    server_name="multi-business-postgres-server",
-                    server_version="1.0.0",
-                    capabilities=postgres_server.server.get_capabilities(DummyNotificationOptions(), {}),
-                ),
-            )
+                logger.info("Starting Multi-Business PostgreSQL MCP server...")
+                await postgres_server.server.run(
+                    read_stream,
+                    write_stream,
+                    InitializationOptions(
+                        server_name="multi-business-postgres-server",
+                        server_version="1.0.0",
+                        capabilities=postgres_server.server.get_capabilities(DummyNotificationOptions(), {}),
+                    ),
+                )
             
     except KeyboardInterrupt:
         logger.info("Server shutdown requested by user (KeyboardInterrupt).")
